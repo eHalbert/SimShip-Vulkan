@@ -28,7 +28,7 @@ Strength (1 to 30 knots) and direction.
 
 **SKY**
 
-Dynamic sky (physical atmosphere with moving volumetric clouds.
+Dynamic sky (physical atmosphere) with moving volumetric clouds.
 Sun positioned according to date and time (day and night).
 Mist and Fog.
 
