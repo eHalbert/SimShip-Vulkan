@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<SimShip>
+	<Config>
+	  <indexPosition>1</indexPosition>
+	  <indexShip>5</indexShip>
+	  <windForce>15</windForce>
+	  <windDir>270</windDir>
+	</Config>
+	<Positions>
+	  <Position name="Treac'h er Goured" lon="-2.94097114" lat="47.38162231" heading="90" />
+	  <Position name="Sud-Ouest de Houat" lon="-2.94683933" lat="47.36368561" heading="270" />
+	  <Position name="Chenal de port Chudell" lon="-2.98219204" lat="47.37321472" heading="008" />
+	  <Position name="Poste 1 port Chudell" lon="-2.98341514" lat="47.3911136" heading="230" />
+	  <Position name="Poste 2 port Chudell" lon="-2.984721" lat="47.392600" heading="270" />
+	  <Position name="Poste 3 port Chudell" lon="-2.987983" lat="47.393559" heading="180" />
+	  <Position name="Port de Houat" lon="-2.95672011" lat="47.3929329" heading="119" />
+	  <Position name="Sud-Est de Houat" lon="-2.95533204" lat="47.3732452" heading="270" />
+	  <Position name="Nord du port de Hoedic" lon="-2.87535810" lat="47.35971069" heading="180" />
+	  <Position name="Nord des Poulains" lon="-3.25751114" lat="47.41410065" heading="180" />
+	  <Position name="Pointe de Taillefer" lon="-3.17245865" lat="47.37046814" heading="90" />
+	  <Position name="Port du Palais" lon="-3.15052176" lat="47.34687805" heading="120" />
+	  <Position name="Pointe de Kerdonis" lon="-3.04943943" lat="47.30228424" heading="31" />
+	  <Position name="Port Herlin" lon="-3.173708" lat="47.294899" heading="240" />
+	  <Position name="Port Kerel" lon="-3.203461" lat="47.295238" heading="90" />
+	  <Position name="Port Ster-Vraz" lon="-3.250378" lat="47.372738" heading="302" />
+	</Positions>
+</SimShip>
