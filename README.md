@@ -1,4 +1,5 @@
 **SimShip**
+
 Simulation of a ship moving on a cinematic-quality ocean.
 
 (https://www.youtube.com/watch?v=g61SMdqNZc8)
@@ -12,9 +13,10 @@ The rendering of the 3D scene is optimized to ensure consistency of visual quali
 
 **OCEAN**
 
-Spectral wind wave model, based on Phillips spectrum.
+Spectral wind wave model.
+Several spectra: Phillips, Bretschneider,	Pierson-Moskowitz, JONSWAP,	OchiHubble, Texel-Marsen-Arsloe, Donelan-Banner, Torsethaugen, Elfouhaily, Horvath.
 Dynamic PBR anisotropic BRDF.
-Foam simulation.
+Foam simulation on waves.
 Underwater view.
 Instanced patches defined by LOD settings.
 Host readbacks for in-game physics.
@@ -26,16 +28,17 @@ Strength (1 to 30 knots) and direction.
 
 **SKY**
 
-Dynamic sky (physical atmosphere) with moving volumetric clouds, godrays and bloom.
+Dynamic sky (physical atmosphere with moving volumetric clouds.
 Sun positioned according to date and time (day and night).
 Mist and Fog.
 
 **SHIP**
 
 Full motion over 6 degrees of freedom (surge, sway, heave, yaw, pitch, roll).
-Ship motion forces (archimede, gravity, viscous resistance, wave resistance, residual resistance, wind drift, wind rotation, thuster, bow thruster, stern thruster, propellers, rudder).
+Ship motion forces (archimede, gravity, viscous resistance, wave resistance, wind drift, wind rotation, thuster, bow thruster, stern thruster, propellers, rudder).
 Propellers and radars animated.
 Reflection of the ship on the water.
+Shadow.
 Wake simulation (Kelvin waves, foam and bubbles).
 Smoke simulated with particles.
 Flag animated.
@@ -48,8 +51,10 @@ Camera full smooth motion (orbital around the ship, fps, fixed views and free vi
 3D sounds (engines, seagulls, horn).
 Terrain (islands).
 Markup (buoys with lights).
-Lighthouses with beamlights
-Compilation
+Lighthouses with beamlights.
+
+**Compilation;;
 Only c++ files and shaders are provided with some resource files. Compilation needs the installation of several librairies.
-License
+
+**License**
 Creative Commons CC BY-NC. This license enables reusers to distribute, remix, adapt, and build upon the material in any medium or format for noncommercial purposes only, and only so long as attribution is given to the creator.
