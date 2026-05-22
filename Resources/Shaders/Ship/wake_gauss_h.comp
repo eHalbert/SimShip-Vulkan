@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, r8) uniform readonly image2D inputTex;
+layout(binding = 1, r8) uniform image2D outputTex;
+
+layout(set = 0, binding = 2) uniform BlurParams {
+    float texelWidth; // 1.0 / textureWidth
+} params;
+
+const float noiseStrength = 0.1;
+
+float rand(vec2 co) {
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main()
+{
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(inputTex);
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    vec2 uv = vec2(coord) / vec2(size);
+
+    float kernel[5] = float[](0.204164, 0.304005, 0.093913, 0.010381, 0.000229);
+    float sum = 0.0;
+    for (int i = -4; i <= 4; ++i) 
+    {
+        ivec2 sampleCoord = clamp(coord + ivec2(i, 0), ivec2(0), size - 1);
+        sum += imageLoad(inputTex, sampleCoord).r * kernel[abs(i)];
+    }
+    if (sum != 0.0) 
+    {
+        float noise = (rand(uv) - 0.5) * noiseStrength;
+        sum += noise;
+    }
+
+    imageStore(outputTex, coord, vec4(clamp(sum, 0.0, 1.0), 0.0, 0.0, 1.0));
+}
