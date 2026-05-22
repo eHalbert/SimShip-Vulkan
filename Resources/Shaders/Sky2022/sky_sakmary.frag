@@ -1,0 +1,208 @@
+// Parts of code take from https://github.com/SebLague/Clouds/blob/master/Assets/Scripts/Clouds/Shaders/Clouds.shader
+#version 450
+
+#include "common_func.glsl"
+
+layout(binding = 0) uniform CommonUBO
+{
+    mat4    model;
+    mat4    view;
+    mat4    proj;
+    float   time;
+	mat4    lHviewProj;
+} commonUbo;
+layout(binding = 1) uniform AtmosphereUBO
+{
+    vec3    solar_irradiance;
+    float   sun_angular_radius;
+    vec3    absorption_extinction;
+    vec3    rayleigh_scattering; 
+    float   mie_phase_function_g;
+    vec3    mie_scattering; 
+    float   bottom_radius;
+    vec3    mie_extinction; 
+    float   top_radius;
+    vec3    mie_absorption;
+    vec3    ground_albedo;
+    vec4    rayleigh_density[3];
+    vec4    mie_density[3];
+    vec4    absorption_density[3];
+    vec2    TransmittanceTexDimensions;
+    vec2    MultiscatteringTexDimensions;
+    vec2    SkyViewTexDimensions;
+    vec3    sun_direction;
+    vec3    camera_position;
+    vec3    moonDirection;
+    float   moonPhase;
+    float   moonIntensity;
+} atmosphereUbo;
+layout (binding = 2) uniform sampler2D skyViewLUT; 
+
+layout (location = 0) in vec2 inUV;
+
+layout (location = 0) out vec4 FragColor;
+
+mat3 yUpToZUp = mat3(     // Échange d'axes Y <-> Z
+    1.0, 0.0,  0.0,  
+    0.0, 0.0,  1.0, 
+    0.0, 1.0,  0.0
+);
+vec3 getSunBloom(vec3 worldDir, vec3 sunDir){
+    const float sunSolidAngle = 0.01453859; // 0.833 * PI / 180.0;
+    const float minSunCosTheta = cos(sunSolidAngle);
+
+    float cosTheta = dot(worldDir, sunDir);
+    if(cosTheta >= minSunCosTheta) {return vec3(0.5) ;}
+    float offset = minSunCosTheta - cosTheta;
+    float gaussianBloom = exp(-offset * 50000.0) * 0.5;
+    float invBloom = 1.0 / (0.02 + offset * 300.0) * 0.01;
+    return vec3(gaussianBloom + invBloom);
+}
+vec3 getMoon(vec3 worldDir, vec3 sunDir) {
+    const vec3 moonLightCol = vec3(0.711, 0.729, 0.847);
+    const float moonRadiusLocal = 0.4;
+    const float moonAngularRadius = 0.01453859; // 0.833 * PI / 180.0;
+    const float minMoonCosTheta = cos(moonAngularRadius);
+    
+    float cosTheta = dot(worldDir, atmosphereUbo.moonDirection);
+    
+    // === HALO PROPORTIONNEL ===
+    float haloIntensity = 1.0 - abs(atmosphereUbo.moonPhase);  // 0=fort, ±1=faible
+    if (cosTheta < minMoonCosTheta) {
+        float offset = minMoonCosTheta - cosTheta;
+        float gaussianBloom = exp(-offset * 50000.0) * 0.4;
+        float invBloom = 1.0 / (0.02 + offset * 300.0) * 0.008;
+        float nightIntensity = pow(1.0 - smoothstep(-0.3, 0.1, sunDir.y), 2.0);
+        float sunSep = acos(clamp(dot(sunDir, atmosphereUbo.moonDirection), -1.0, 1.0));
+        float visible = step(25.0 * PI / 180.0, sunSep);
+        
+        return moonLightCol * (gaussianBloom + invBloom) * haloIntensity * nightIntensity * visible * 0.8;
+    }
+    
+    // Disque lunaire
+    float moonScale = sin(moonAngularRadius);
+    vec2 mUV = (worldDir - atmosphereUbo.moonDirection * cosTheta).xy / moonScale * moonRadiusLocal;
+    float mDist = length(mUV);
+    
+    float z = sqrt(max(0.0, moonRadiusLocal * moonRadiusLocal - mDist * mDist));
+    vec3 normal = normalize(vec3(mUV.x, mUV.y, z));
+    
+    // === PHASE CORRIGÉE ===
+    // moonPhase: -1/1(nouvelle) ? 0(pleine)
+    float illuminatedFraction = 1.0 - abs(atmosphereUbo.moonPhase);
+    float halfAngle = acos(illuminatedFraction);  // petit angle pour presque noire
+    
+    vec3 lightDir = normalize(vec3(sin(halfAngle) * sign(atmosphereUbo.moonPhase), 0.0, cos(halfAngle) ));
+    
+    // Éclairage sans ambient
+    float NdotL = max(0.0, dot(normal, lightDir));
+    float lum = NdotL * 2.5;  // Ombre = 0.0
+    
+    vec3 moonCol = moonLightCol * lum;
+    
+    // Night + visibility + phase globale
+    float nightIntensity = pow(1.0 - smoothstep(-0.3, 0.1, sunDir.y), 2.0);
+    float sunSep = acos(clamp(dot(sunDir, atmosphereUbo.moonDirection), -1.0, 1.0));
+    float visible = step(25.0 * PI / 180.0, sunSep);
+    
+    return moonCol * visible * nightIntensity * haloIntensity * 0.8 * atmosphereUbo.moonIntensity;
+}
+float hash13(vec3 p3)
+{
+    p3  = fract(p3 * vec3(.1031, .11369, .13787));
+    p3 += dot(p3, p3.yzx + 19.19);
+    return fract((p3.x + p3.y) * p3.z);
+}
+vec3 getStars(vec3 ray)
+{
+    const float STARDISTANCE = 180.0;
+    const float STARBRIGHTNESS = 0.4;
+    const float STARDENSITY = 0.12;
+
+    vec3 p = ray * STARDISTANCE;
+    
+    // === DENSITÉ ATMOSPÉRHIQUE RÉALISTE ===
+    vec3 camera = yUpToZUp * atmosphereUbo.camera_position;
+    vec3 upVector = normalize(camera + vec3(0, atmosphereUbo.bottom_radius, 0));
+    float zenithAngle = acos(clamp(dot(ray, upVector), -1.0, 1.0)); // 0=zénith, PI=horizon
+    
+    // MOINS D'ÉTOILES PRÈS HORIZON (plus d'atmosphère à traverser)
+    float atmosAttenuation = exp(-zenithAngle * 0.8);  // 1.0 zénith ? 0.3 horizon
+    float density = smoothstep(1.0 - STARDENSITY * atmosAttenuation, 1.0, hash13(floor(p)));
+    
+    // Brillance très variable
+    float brightnessSeed = hash13(floor(p) + 1.0);
+    float starBrightness = mix(0.05, 3.0, brightnessSeed * brightnessSeed);
+    
+    // === COULEURS ===
+    float colorSeed = hash13(floor(p) + 2.0);
+    vec3 starColor;
+    if(colorSeed < 0.2)         starColor = vec3(0.4, 0.7, 1.6);
+    else if(colorSeed < 0.35)   starColor = vec3(1.6, 0.9, 0.4);
+    else                        starColor = vec3(1.0, 0.98, 0.95);
+    
+    // Forme d'étoile
+    vec3 cell = fract(p) - 0.5;
+    float starDist = length(cell);
+    float starShape = 1.0 - smoothstep(0.0, STARBRIGHTNESS * starBrightness * 0.4, starDist);
+    starShape = pow(starShape, 15.0);
+    
+    // Flicker
+    float flicker = cos(commonUbo.time * 0.8 + hash13(abs(p)) * 10.0) * 0.3 + 0.7;
+    
+    // Intensité finale avec + d'étoiles zénith
+    float intensity = density * starBrightness * starShape * flicker * 1.2 * atmosAttenuation;
+    
+    return starColor * intensity;
+}
+vec3 aces(vec3 x) {
+    // Krzysztof Narkowicz 2015, "ACES Filmic Tone Mapping Curve"
+    float a = 2.51f;
+    float b = 0.03f;
+    float c = 2.43f;
+    float d = 0.59f;
+    float e = 0.14f;
+    vec3 mapped = clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    return mapped; 
+}
+
+
+void main()
+{
+    const vec3 camera = yUpToZUp * atmosphereUbo.camera_position; // Calculations are done in km (conversion in cpp code)
+    vec3 sun_direction = atmosphereUbo.sun_direction;
+    vec2 atmosphereBoundaries = vec2(atmosphereUbo.bottom_radius, atmosphereUbo.top_radius);
+
+    mat4 invViewProjMat = inverse(commonUbo.proj * commonUbo.view);
+    vec3 ClipSpace = vec3(inUV * vec2(2.0) - vec2(1.0), 1.0);
+    
+    vec4 Hpos = invViewProjMat * vec4(ClipSpace, 1.0);
+
+    vec3 WorldDir = normalize(Hpos.xyz / Hpos.w - camera); 
+    vec3 WorldPos = camera + vec3(0, atmosphereUbo.bottom_radius, 0);   // Unit is km
+
+    float viewHeight = length(WorldPos);
+    vec3 UpVector = normalize(WorldPos);
+    float viewZenithAngle = acos(dot(WorldDir, UpVector));
+
+    float lightViewAngle = acos(dot(WorldDir, sun_direction));
+    bool IntersectGround = raySphereIntersectNearest(WorldPos, WorldDir, vec3(0.0, 0.0, 0.0), atmosphereUbo.bottom_radius) >= 0.0;
+
+    vec2 uv = SkyViewLutParamsToUv(IntersectGround, vec2(viewZenithAngle,lightViewAngle), viewHeight, atmosphereBoundaries, atmosphereUbo.SkyViewTexDimensions);
+
+    vec3 L = texture(skyViewLUT, uv).rgb;
+
+    if(!IntersectGround)
+    {
+        // Solar disk
+        L += L * getSunBloom(WorldDir, sun_direction);
+        // Stars
+        if (sun_direction.y < 0)
+            L += getStars(WorldDir);
+        // Moon disk
+        L += getMoon(WorldDir, sun_direction);
+    }
+
+    L = aces(L * 10.0);
+    FragColor = vec4(L, 1.0);
+}
