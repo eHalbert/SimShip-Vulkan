@@ -1,1 +1,111 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+struct Particle {
+    vec3    position;
+    float   life;
+    vec3    velocity;
+    float   pad;
+    vec4    color;
+};
+
+layout(binding = 0, std430) restrict buffer Particles { 
+    Particle particles[]; 
+};
+layout(binding = 1, std140) uniform UBO {
+    vec3    emitPositions[2];
+    vec3    windDirection;
+} ubo;
+
+layout(push_constant) uniform PushConstants {
+    float dt;
+    int   particlesPerFrame;
+    int   numEmitters;
+    int   frameCount;
+    float shortLife;
+    float longLife;
+} pc;
+
+
+uint hash(uint seed) {
+    seed ^= pc.frameCount * 2246822519u;
+    seed ^= 274763641u;
+    seed *= 2654435769u;
+    seed ^= seed >> 16;
+    seed *= 2654435769u;
+    seed ^= seed >> 16;
+    return seed;
+}
+float rand(uint seed) {
+    return float(hash(seed)) * (1.0 / 4294967296.0);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= particles.length()) return;
+    
+    Particle p = particles[idx];
+    
+
+    if (p.life <= 0.0) 
+    {
+        uint startIdx = (uint(pc.frameCount) * uint(pc.particlesPerFrame)) % uint(particles.length());
+        bool emitThisParticle = false;
+        
+        if (startIdx + uint(pc.particlesPerFrame) <= uint(particles.length()))
+            emitThisParticle = (idx >= startIdx) && (idx < startIdx + uint(pc.particlesPerFrame));
+        else
+            emitThisParticle = (idx >= startIdx) || (idx < (startIdx + uint(pc.particlesPerFrame)) % uint(particles.length()));
+            
+        if (emitThisParticle) 
+        {
+            vec3 randomOffset = vec3(rand(idx + 0u) * 2.0 - 1.0, rand(idx + 1u) * 2.0 - 1.0, rand(idx + 2u) * 2.0 - 1.0) * 0.1;
+    
+            int emitterIdx = int(idx) % pc.numEmitters;
+            p.position = ubo.emitPositions[emitterIdx] + randomOffset;
+    
+            // Dispersion latérale plus large à l'émission (0.2 → 0.6)
+            vec3 randomVel = vec3(rand(idx + 3u) * 2.0 - 1.0, rand(idx + 4u) * 1.0, rand(idx + 5u) * 2.0 - 1.0);
+            randomVel.xz *= 4.0;  // élargissement latéral
+            randomVel.y  *= 0.8;  // montée initiale modérée
+            p.velocity = randomVel;
+    
+            float mid  = (pc.shortLife + pc.longLife) * 0.5;
+            float half0 = (pc.longLife - pc.shortLife) * 2.0;
+            p.life = clamp(mid + (rand(idx + 6u) * 2.0 - 1.0) * half0, 0.1, pc.longLife * 2.0);
+
+            float gray = 0.5 + rand(idx + 7u) * 0.2;
+            p.color = vec4(gray, gray, gray, 0.7);
+        } 
+    } 
+    else 
+    {
+        p.life -= pc.dt;
+
+        // Drag : ralentit progressivement la particule
+        float drag = 1.0 - 3.0 * pc.dt;
+        p.velocity *= max(drag, 0.0);
+
+        // Lift thermique (monte doucement)
+        p.velocity.y += 1.5 * pc.dt;
+
+        // Vent
+        p.velocity += ubo.windDirection * pc.dt;
+
+        // Turbulence croissante avec l'âge (s'élargit au fil du temps)
+        float age = 1.0 - (p.life / pc.longLife); // 0.0 = jeune, 1.0 = vieux
+        float turb = 5.0 + 15.0 * age;             // turbulence faible au départ, forte ensuite
+
+        p.velocity += turb * vec3(
+            rand(idx + 8u)  * 2.0 - 1.0,
+            rand(idx + 9u)  * 2.0 - 1.0,
+            rand(idx + 10u) * 2.0 - 1.0
+        ) * pc.dt;
+    
+        p.position += p.velocity * pc.dt;
+    }
+    
+    particles[idx] = p;
+
+}
