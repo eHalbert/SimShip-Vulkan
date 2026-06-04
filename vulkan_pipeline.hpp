@@ -2,7 +2,7 @@
 
 #pragma once
 
-// 1. PROJET
+// 1. PROJECT
 #include "vulkan_device.hpp"
 #include "vulkan_swapchain.hpp"
 

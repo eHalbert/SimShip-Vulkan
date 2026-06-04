@@ -2,7 +2,7 @@
 
 #pragma once
 
-// 1. PROJET
+// 1. PROJECT
 
 // 2. LIB
 #include <vulkan/vulkan.h>

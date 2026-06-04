@@ -4,7 +4,7 @@ http://creativecommons.org/licenses/by-nc-nd/4.0/ */
 
 #pragma once
 
-// 1. PROJET
+// 1. PROJECT
 #include "vulkan_ubo.hpp"
 #include "vulkan_buffer.hpp"
 
@@ -97,10 +97,8 @@ struct sOceanUBO
 	int			    texLayer;
     float 		    mistDensity;
 
-    vec2    windDir;        // Wind direction vector in world XZ (e.g. (-7.7, 0) = westerly)
-    float   windRippleStr;  // Capillary ripple strength [0..1], 0 = disabled
-    float   windSpeed;      // Ripple tile scale (try 0.05..0.3)
-
+    float           mistGain;
+	float		    padding[3];
 };
 struct sPipeline_1   // For 1 frame in flight
 {
