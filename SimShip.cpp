@@ -7,6 +7,38 @@ int IMGUI_STYLE     = 4;
 extern pair<string, uint64_t> OceanTimeStamps[5];
 
 /*
+OCEAN UPDATE : Compute shaders
+├── Compute spectrum
+├── Compute : IFFT — 4 passes
+│   ├── IFFT pass 0  : mIfftDescriptorSets[0] → Dispatch FFT_SIZE × 1 × 1
+│   ├── IFFT pass 1  : mIfftDescriptorSets[1] → Dispatch FFT_SIZE × 1 × 1
+│   ├── IFFT pass 2  : mIfftDescriptorSets[2] → Dispatch FFT_SIZE × 1 × 1
+│   └── IFFT pass 3  : mIfftDescriptorSets[3] → Dispatch FFT_SIZE × 1 × 1
+├── Compute displacements
+└── Compute gradients + foam accumulator
+
+SHIP UPDATE
+├── Update World Matrix
+├── Transform Vertices
+├── Get Height Of All Vertices
+├── Get Tris Under Water
+├── Compute Forces
+│   ├── Archimede
+│   ├── Gravity
+│   ├── Heave Drag
+│   ├── Main Thrust
+│   ├── Propellers Drag
+│   ├── Viscous Drag
+│   ├── Waves Drag
+│   ├── Bow Thrust
+│   ├── Stern Thrust
+│   ├── Rudder
+│   ├── Wind
+│   └── Centrifugal
+├── Compute Position and Attitude
+├── Compute Autopilot
+└── Update Wake mesh and Wake texture
+
 RENDER PASS 0 : g_RenderPassShadow (1x)
 ├── 1 ATTACHMENT    : g_TexShadowDepth (1x)       → Texture for Ocean Shader & Model shader
 └── 1 FRAMEBUFFER   : g_ShadowFramebuffer
@@ -27,12 +59,12 @@ ATMOSPHERE : Compute shaders (hors render pass)
 └── Assemble sky+clouds → g_Clouds PostProcess Texture
 
 RENDER PASS 3 : g_RenderPassScene (5 ATTACHMENTS, 1 SUBPASS)
-├── ATTACHMENT 0 : g_ColorImageView (MSAA 8x)     → Rendu COLOR MSAA
-├── ATTACHMENT 1 : g_vSwapChainImageViews[i] (1x) → Resolve COLOR (temporaire)
-├── ATTACHMENT 2 : g_DepthImageView (MSAA 8x)     → Rendu DEPTH MSAA
-├── ATTACHMENT 3 : g_DepthViewResolve (1x)        → Resolve DEPTH (ScreenQuad)
-└── ATTACHMENT 4 : g_ColorViewResolve (1x)        → ScreenQuad COLOR input
-└── 2 FRAMEBUFFERS : g_vFramebuffersSwapChain[0..1]
+├── ATTACHMENT 0    : g_ColorImageView (MSAA 8x)     → Rendu COLOR MSAA
+├── ATTACHMENT 1    : g_vSwapChainImageViews[i] (1x) → Resolve COLOR (temporaire)
+├── ATTACHMENT 2    : g_DepthImageView (MSAA 8x)     → Rendu DEPTH MSAA
+├── ATTACHMENT 3    : g_DepthViewResolve (1x)        → Resolve DEPTH (ScreenQuad)
+└── ATTACHMENT 4    : g_ColorViewResolve (1x)        → ScreenQuad COLOR input
+└── 2 FRAMEBUFFERS  : g_vFramebuffersSwapChain[0..1]
 
 RENDER PASS 4 : g_RenderPassPostProcess (1x)
 ├── 1 ATTACHMENT    : g_vSwapChainImageViews[i] (1x) → LOAD/STORE final
@@ -40,7 +72,7 @@ RENDER PASS 4 : g_RenderPassPostProcess (1x)
 
 RENDER PASS 5 : g_RenderPassImGui (1x)
 ├── 1 ATTACHMENT    : g_vSwapChainImageViews[i] (1x) → LOAD/STORE (over post-process)
-└── 2 FRAMEBUFFERS  : g_vFramebuffersPostProcess[0..1] (réutilisés)
+└── 2 FRAMEBUFFERS  : g_vFramebuffersPostProcess[0..1]
 */
 
 void SwitchToFullScreen()
@@ -1118,7 +1150,7 @@ void RenderCompass(float x, float y, float radius)
         int numSegments = (int)(fabsf(arcSpan) * 40.0f) + 2;
         if (numSegments > 128) numSegments = 128;
 
-        std::vector<ImVec2> points;
+        vector<ImVec2> points;
         points.reserve(numSegments + 1);
 
         for (int i = 0; i <= numSegments; i++)
@@ -2427,7 +2459,7 @@ void RenderSpectrum()
     // --- Label Y axis ---
     const char* yLabel = "S(k) / S(f)  normalized";
     ImVec2 ySz = ImGui::CalcTextSize(yLabel);
-    draw->AddText(ImVec2(pMin.x - ySz.x * 0.5f, pMin.y - ySz.y - 6), IM_COL32(180, 180, 220, 220), yLabel);
+    draw->AddText(ImVec2(pMin.x, pMin.y - ySz.y - 6), IM_COL32(180, 180, 220, 220), yLabel);
 
     ImGui::End();
 }
@@ -2461,6 +2493,7 @@ void FrameImGui(VkCommandBuffer commandBuffer)
         ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always);
         ImGui::SetNextWindowSize(window_size, ImGuiCond_FirstUseEver);
 
+        /////////////////////////////////
         if (ImGui::Begin("Scene [F2]", &g_bShowSceneWindow))
         {
             ImGui::Checkbox("VSYNC", &g_bTargetFps);
@@ -2579,8 +2612,9 @@ void FrameImGui(VkCommandBuffer commandBuffer)
             {
                 if (g_Ocean)
                 {
-                    ImGui::SliderFloat("Lambda", &g_Ocean->Lambda, 0.0f, 1.0f, "%0.2f");
-                    if (ImGui::SliderFloat("Foam", &g_Ocean->PersistenceSec, 0.0f, 5.0f, "%0.1f s")) g_Ocean->EvaluatePersistence(g_Ocean->PersistenceSec);
+                    ImGui::SliderFloat("Camber", &g_Ocean->Camber, 0.0f, 5.0f, "%0.2f");
+                    ImGui::SliderFloat("Break", &g_Ocean->FoamBreak, 0.0f, 1.0f, "%0.2f");
+                    if (ImGui::SliderFloat("Persistence", &g_Ocean->FoamPersistence, 0.0f, 5.0f, "%0.1f s")) g_Ocean->EvaluatePersistence(g_Ocean->FoamPersistence);
                     ImGui::Text("Whitecap theor. %.3f %% - real %.3f %%", g_Ocean->WhitecapCoverageTheoretical, g_Ocean->WhitecapCoverageReal);
                     ImGui::SliderFloat("Transparency", &g_Ocean->Transparency, 0.0f, 1.0f, "%0.2f");
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 0.0f, 1.0f));
@@ -2727,8 +2761,9 @@ void FrameImGui(VkCommandBuffer commandBuffer)
                     g_Sky->SetMieDensity(-1.0 / mieScaleHeight);
                 }
             }
+  
             /////////////////////////////////
-            if (ImGui::CollapsingHeader("ATMOSPHERE", ImGuiTreeNodeFlags_DefaultOpen))
+            if (ImGui::CollapsingHeader("ATMOSPHERE"))
             {
                 ImGui::Separator();
 
@@ -2769,7 +2804,7 @@ void FrameImGui(VkCommandBuffer commandBuffer)
             }
 
             /////////////////////////////////
-            if (ImGui::CollapsingHeader("CLOUDS", ImGuiTreeNodeFlags_DefaultOpen))
+            if (ImGui::CollapsingHeader("CLOUDS"))
             {
                 ImGui::SliderFloat("Coverage", &g_Clouds->Coverage, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderFloat("Speed##3", &g_Clouds->CloudSpeed, 0.0f, 2000.0f, "%.0f");
@@ -5667,12 +5702,15 @@ void LoadTerrains()
             {
                 g_idxHouat = n;
             }
-            else
-            {
-#ifdef DEMO
+//            else
+//            {
+//#ifdef DEMO
+//                continue;
+//#endif
+//            }
+
+            if (file.find("port") != string::npos)
                 continue;
-#endif
-            }
 
             if (file.find("c002_") != string::npos)
                 g_idxHoedic = n;
@@ -5765,6 +5803,476 @@ void LoadPortContour()
         vec4 p_transformed2 = model * p_homo2;
         line.p2 = vec2(p_transformed2.x, p_transformed2.z);
     }
+}
+void CM_ComputeBounds()
+{
+    float minX = 1e9f, maxX = -1e9f;
+    float minZ = 1e9f, maxZ = -1e9f;
+
+    for (auto& t : g_vTerrains)
+    {
+        // terrain.pos = lonlat_to_opengl(center) — set in LoadTerrains, reliable
+        const float ox = t.pos.x;
+        const float oz = t.pos.z;
+
+        std::ifstream f(t.file);
+        std::string line;
+        while (std::getline(f, line))
+        {
+            if (line.size() < 2 || line[0] != 'v' || line[1] != ' ')
+                continue;
+            std::istringstream ss(line.substr(2));
+            float vx, vy, vz;
+            if (!(ss >> vx >> vy >> vz)) continue;
+
+            float wx = ox + vx;
+            float wz = oz + vz;
+            minX = std::min(minX, wx);
+            maxX = std::max(maxX, wx);
+            minZ = std::min(minZ, wz);
+            maxZ = std::max(maxZ, wz);
+        }
+
+        //printf("[ControlMap] Bounds pass: %s  pos=(%.1f,%.1f)   local X[%.1f..%.1f]  local Z[%.1f..%.1f]\n", t.name.c_str(), ox, oz, minX - ox, maxX - ox, minZ - oz, maxZ - oz);
+    }
+
+    const float margin = 500.f;
+    CM_minX = minX - margin;
+    CM_minZ = minZ - margin;
+    CM_sizeX = (maxX + margin) - CM_minX;
+    CM_sizeZ = (maxZ + margin) - CM_minZ;
+
+    //printf("[ControlMap] World X [%.1f .. %.1f]  Z [%.1f .. %.1f]\n", CM_minX, CM_minX + CM_sizeX, CM_minZ, CM_minZ + CM_sizeZ);
+    //printf("[ControlMap] %.2f m/px (X)  %.2f m/px (Z)\n", CM_sizeX / CM_W, CM_sizeZ / CM_H);
+}
+vec2 CM_ToTexel(float wx, float wz)
+{
+    // World XZ → texel (no clamping — caller must check bounds)
+    
+    return { (wx - CM_minX) / CM_sizeX * CM_W, (wz - CM_minZ) / CM_sizeZ * CM_H };
+}
+void CM_RasteriseTri(vector<uint8_t>& presence, vec2 a, vec2 b, vec2 c)
+{
+    // ── triangle rasteriser ───────────────────────────────────────────────────────
+
+    vec2 ta = CM_ToTexel(a.x, a.y);
+    vec2 tb = CM_ToTexel(b.x, b.y);
+    vec2 tc = CM_ToTexel(c.x, c.y);
+
+    int minX = std::max(0, (int)std::floor(std::min({ ta.x, tb.x, tc.x })));
+    int maxX = std::min(CM_W - 1, (int)std::ceil(std::max({ ta.x, tb.x, tc.x })));
+    int minY = std::max(0, (int)std::floor(std::min({ ta.y, tb.y, tc.y })));
+    int maxY = std::min(CM_H - 1, (int)std::ceil(std::max({ ta.y, tb.y, tc.y })));
+
+    if (minX > maxX || minY > maxY) return;
+
+    // Edge function (signed area)
+    auto edge = [](vec2 p, vec2 q, vec2 r) {
+        return (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+        };
+    float area = edge(ta, tb, tc);
+    if (std::abs(area) < 0.5f) return;     // degenerate triangle
+
+    for (int y = minY; y <= maxY; y++)
+        for (int x = minX; x <= maxX; x++)
+        {
+            vec2 p{ x + 0.5f, y + 0.5f };
+            float w0 = edge(tb, tc, p);
+            float w1 = edge(tc, ta, p);
+            float w2 = edge(ta, tb, p);
+            bool inside = (area > 0) ? (w0 >= 0.f && w1 >= 0.f && w2 >= 0.f) : (w0 <= 0.f && w1 <= 0.f && w2 <= 0.f);
+            if (inside)
+                presence[y * CM_W + x] = 1;
+        }
+}
+void CM_RasteriseIsland(vector<uint8_t>& presence, const sTerrain& terrain)
+{
+    // ── rasterise one island ──────────────────────────────────────────────────────
+  
+    // Island origin in world space (OpenGL metres)
+    
+    // terrain.pos is already set to lonlat_to_opengl(center) in LoadTerrains
+    const float ox = terrain.pos.x;
+    const float oz = terrain.pos.z;
+
+    ifstream f(terrain.file);
+    if (!f.is_open()) return;
+
+    string line;
+    vector<vec2> verts;   // world-space XZ
+
+    while (std::getline(f, line))
+    {
+        if (line.size() < 2) continue;
+
+        if (line[0] == 'v' && line[1] == ' ')
+        {
+            // Vertex: local metres → world XZ
+            istringstream ss(line.substr(2));
+            float x, y, z;
+            ss >> x >> y >> z;
+            verts.push_back({ ox + x, oz + z });
+        }
+        else if (line[0] == 'f' && line[1] == ' ')
+        {
+            // Face: fan-triangulate (handles tris, quads, n-gons)
+            istringstream ss(line.substr(2));
+            string tok;
+            vector<int> idx;
+            while (ss >> tok)
+            {
+                // Support f v, f v/vt, f v/vt/vn, f v//vn
+                int i = std::stoi(tok.substr(0, tok.find('/'))) - 1;
+                if (i >= 0 && i < (int)verts.size())
+                    idx.push_back(i);
+            }
+            // Fan from first vertex
+            for (int i = 1; i + 1 < (int)idx.size(); i++)
+                CM_RasteriseTri(presence, verts[idx[0]], verts[idx[i]], verts[idx[i + 1]]);
+        }
+    }
+}
+vector<float> CM_DistanceField(const vector<uint8_t>& presence, float falloffMetres)
+{
+    const float mPerPxX = CM_sizeX / CM_W;
+    const float mPerPxZ = CM_sizeZ / CM_H;
+    const float mPerPx = (mPerPxX + mPerPxZ) * 0.5f;
+
+    // -------------------------------------------------------------------------
+    // Phase 1 — per-column 1D distance on Y axis (Z world axis)
+    // g[y*W+x] = closest land pixel distance on the vertical axis, in pixels
+    // -------------------------------------------------------------------------
+    vector<float> g(CM_W * CM_H, (float)(CM_H));
+
+    for (int x = 0; x < CM_W; x++)
+    {
+        // Forward pass: top → bottom
+        if (presence[0 * CM_W + x])
+            g[0 * CM_W + x] = 0.f;
+        for (int y = 1; y < CM_H; y++)
+        {
+            int i = y * CM_W + x;
+            g[i] = presence[i] ? 0.f : g[(y - 1) * CM_W + x] + 1.f;
+        }
+
+        // Backward pass: bottom → top
+        for (int y = CM_H - 2; y >= 0; y--)
+        {
+            int i = y * CM_W + x;
+            float below = g[(y + 1) * CM_W + x] + 1.f;
+            if (below < g[i]) g[i] = below;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2 — per-row parabola lower envelope on X axis (Meijster)
+    // Combines vertical distance g[x] with horizontal offset to get true L2.
+    //
+    // For each row y, we have a set of parabolas:
+    //   f(x, i) = (x - i)^2 + g[i]^2
+    // one per column i. The EDT value at column x is:
+    //   D(x) = min over all i of f(x, i)
+    // i.e. the lower envelope of all parabolas.
+    //
+    // The envelope is built left-to-right with a stack of (center, left-boundary)
+    // pairs. A new parabola u replaces the top of the stack if it dominates it
+    // at the top's left boundary, or extends the envelope to the right otherwise.
+    // -------------------------------------------------------------------------
+    vector<float> dist(CM_W * CM_H);
+    vector<int>   s(CM_W);   // stack: parabola centers
+    vector<int>   t(CM_W);   // stack: left boundary of each parabola's segment
+    vector<float> gs(CM_W);  // g[x]^2 for the current row
+
+    for (int y = 0; y < CM_H; y++)
+    {
+        // Cache g² for this row
+        for (int x = 0; x < CM_W; x++)
+        {
+            float v = g[y * CM_W + x];
+            gs[x] = v * v;
+        }
+
+        // f(x, i) = (x-i)^2 + gs[i]   — parabola centered at i, offset by gs[i]
+        auto f = [&](int x, int i) -> float {
+            float dx = (float)(x - i);
+            return dx * dx + gs[i];
+            };
+
+        // Intersection (rounded down + 1) of parabolas centered at i and u:
+        //   (x-i)^2 + gs[i] = (x-u)^2 + gs[u]
+        //   x = (u^2 - i^2 + gs[u] - gs[i]) / (2*(u-i))
+        // We add 1 because we want the first column where u is strictly better.
+        auto sep = [&](int i, int u) -> int {
+            return (int)std::floor(
+                ((float)(u * u - i * i) + gs[u] - gs[i]) / (float)(2 * (u - i))
+            ) + 1;
+            };
+
+        // Build lower envelope left → right
+        int q = 0;      // stack top index
+        s[0] = 0;      // first parabola is centered at x=0
+        t[0] = 0;      // its segment starts at x=0
+
+        for (int u = 1; u < CM_W; u++)
+        {
+            // Pop parabolas dominated by u at their own left boundary
+            while (q >= 0 && f(t[q], s[q]) >= f(t[q], u))
+                q--;
+
+            if (q < 0)
+            {
+                // All previous parabolas dominated — u takes over from x=0
+                q = 0;
+                s[0] = u;
+                t[0] = 0;
+            }
+            else
+            {
+                // Find where u becomes better than the current top
+                int w = sep(s[q], u);
+                if (w < CM_W)
+                {
+                    q++;
+                    s[q] = u;
+                    t[q] = w;
+                }
+                // If w >= CM_W, u never wins within the texture — discard it
+            }
+        }
+
+        // Scan right → left: assign each column to its winning parabola
+        for (int u = CM_W - 1; u >= 0; u--)
+        {
+            dist[y * CM_W + u] = f(u, s[q]);
+            if (u == t[q]) q--;     // crossed the left boundary → pop
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Convert squared pixel distance → metres, apply falloff ramp [0, 1]
+    // chanR = 1 at the shoreline, 0 beyond falloffMetres
+    // -------------------------------------------------------------------------
+    vector<float> chanR(CM_W * CM_H);
+    for (int i = 0; i < CM_W * CM_H; i++)
+    {
+        float distM = std::sqrt(dist[i]) * mPerPx;
+        chanR[i] = std::max(0.f, 1.f - distM / falloffMetres);
+    }
+    return chanR;
+}
+void CM_RasteriseTriHeight(vec3 a, vec3 b, vec3 c)
+{
+    // Same barycentric rasteriser as CM_RasteriseTri, but interpolates Y elevation and keeps the maximum per texel
+
+    auto toT = [&](vec3 p) -> vec2 {
+        return { (p.x - CM_minX) / CM_sizeX * CM_W, (p.z - CM_minZ) / CM_sizeZ * CM_H };
+        };
+    vec2 ta = toT(a), tb = toT(b), tc = toT(c);
+
+    int minX = std::max(0, (int)std::floor(std::min({ ta.x, tb.x, tc.x })));
+    int maxX = std::min(CM_W - 1, (int)std::ceil(std::max({ ta.x, tb.x, tc.x })));
+    int minY = std::max(0, (int)std::floor(std::min({ ta.y, tb.y, tc.y })));
+    int maxY = std::min(CM_H - 1, (int)std::ceil(std::max({ ta.y, tb.y, tc.y })));
+    if (minX > maxX || minY > maxY) return;
+
+    auto edge = [](vec2 p, vec2 q, vec2 r) {
+        return (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+        };
+    float area = edge(ta, tb, tc);
+    if (std::abs(area) < 0.5f) return;
+
+    for (int y = minY; y <= maxY; y++)
+        for (int x = minX; x <= maxX; x++)
+        {
+            vec2 p{ x + 0.5f, y + 0.5f };
+            float w0 = edge(tb, tc, p);
+            float w1 = edge(tc, ta, p);
+            float w2 = edge(ta, tb, p);
+            bool inside = (area > 0) ? (w0 >= 0.f && w1 >= 0.f && w2 >= 0.f) : (w0 <= 0.f && w1 <= 0.f && w2 <= 0.f);
+            if (!inside) continue;
+
+            // Barycentric interpolation of elevation
+            float denom = edge(ta, tb, tc);
+            float wa = w0 / denom;
+            float wb = w1 / denom;
+            float wc = w2 / denom;
+            float elev = wa * a.y + wb * b.y + wc * c.y;
+
+            int idx = y * CM_W + x;
+            if (elev > g_Heightmap[idx])
+                g_Heightmap[idx] = elev;   // keep max elevation per texel
+        }
+}
+void CM_BuildHeightmap()
+{
+    // We re-read the OBJ files to get the Y component this time
+
+	g_Heightmap.resize(CM_W * CM_H, 0.f);
+
+    for (auto& t : g_vTerrains)
+    {
+        const float ox = t.pos.x;
+        const float oz = t.pos.z;
+
+        ifstream f(t.file);
+        string line;
+        vector<vec3> verts;
+
+        while (std::getline(f, line))
+        {
+            if (line.size() < 2) continue;
+
+            if (line[0] == 'v' && line[1] == ' ')
+            {
+                istringstream ss(line.substr(2));
+                float vx, vy, vz;
+                if (!(ss >> vx >> vy >> vz)) continue;
+                verts.push_back({ ox + vx, vy, oz + vz });  // vy = elevation in metres
+            }
+            else if (line[0] == 'f' && line[1] == ' ')
+            {
+                istringstream ss(line.substr(2));
+                string tok;
+                vector<int> idx;
+                while (ss >> tok)
+                    idx.push_back(std::stoi(tok.substr(0, tok.find('/'))) - 1);
+
+                // Fan triangulation — rasterise elevation into heightmap
+                for (int i = 1; i + 1 < (int)idx.size(); i++)
+                    CM_RasteriseTriHeight(verts[idx[0]], verts[idx[i]], verts[idx[i + 1]]);
+            }
+        }
+    }
+}
+vector<float> CM_ComputeShelter(vec2 windVelocity)
+{
+    // ── Directional shelter → channel G ───────────────────────────────────────
+    //
+    // For each water texel, cast a ray against the wind direction and accumulate
+    // the angular shelter provided by terrain obstacles.
+    //
+    // Shelter model:
+    //   - Sample the heightmap at steps along the upwind ray
+    //   - For each sample, compute the elevation angle seen from the water texel
+    //   - The maximum angle seen determines the shelter factor:
+    //       angle ≥ SHELTER_FULL  → fully sheltered  (cliffs, high ground)
+    //       angle ≤ SHELTER_NONE  → fully exposed    (open sea, low dunes barely count)
+    //   - Intermediate values interpolate linearly
+    //
+    // This naturally handles:
+    //   - High cliffs upwind  → angle large  → shelter ~ 1  → small waves
+    //   - Low dunes upwind    → angle small  → shelter ~ 0.3 → reduced waves
+    //   - Open water upwind   → angle = 0   → shelter = 0   → full waves
+
+    // Direction the wind comes FROM (upwind = cast ray into the wind)
+    vec2 upwind = glm::normalize(windVelocity);
+
+    float mPerPxX = CM_sizeX / CM_W;
+    float mPerPxZ = CM_sizeZ / CM_H;
+
+    // Step 1 texel at a time along the dominant axis
+    vec2 stepTex = { upwind.x / mPerPxX, upwind.y / mPerPxZ };
+    float maxComp = std::max(std::abs(stepTex.x), std::abs(stepTex.y));
+    if (maxComp < 1e-6f) return vector<float>(CM_W * CM_H, 0.f);
+    stepTex /= maxComp;
+
+    // Real-world metres per texel step
+    float stepM = std::sqrt( (stepTex.x * mPerPxX) * (stepTex.x * mPerPxX) + (stepTex.y * mPerPxZ) * (stepTex.y * mPerPxZ) );
+
+    const float FETCH_DIST_M = 5000.f;
+    const int   MAX_STEPS = (int)(FETCH_DIST_M / stepM);
+
+    // Shelter angle thresholds
+    // The effective shelter angle seen from the water point is atan(H / dist).
+    // This naturally decreases with distance — no stacking needed.
+    const float SHELTER_NONE = 0.3f;   // degrees — open sea / flat land
+    const float SHELTER_FULL = 8.0f;   // degrees — high cliffs close by
+
+    vector<float> chanG(CM_W * CM_H, 0.f);
+
+    for (int y = 0; y < CM_H; y++)
+        for (int x = 0; x < CM_W; x++)
+        {
+            if (g_Heightmap[y * CM_W + x] > 0.f) continue;
+
+            // Walk the ray upwind — keep only the MAX elevation angle seen.
+            // atan(H / dist) naturally gives a larger angle for close/high obstacles and a smaller angle for distant/low ones. Beyond the obstacle's shadow
+            // cone the angle drops off automatically — no explicit decay needed.
+            float maxAngleDeg = 0.f;
+
+            float rx = x + 0.5f;
+            float ry = y + 0.5f;
+
+            for (int step = 1; step <= MAX_STEPS; step++)
+            {
+                rx += stepTex.x;
+                ry += stepTex.y;
+
+                int sx = (int)rx;
+                int sy = (int)ry;
+                if (sx < 0 || sx >= CM_W || sy < 0 || sy >= CM_H) break;
+
+                float elev = g_Heightmap[sy * CM_W + sx];
+                if (elev <= 0.f) continue;
+
+                // Elevation angle of this obstacle from the water texel
+                float distM = step * stepM;
+                float angleDeg = glm::degrees(std::atan2(elev, distM));
+
+                // Keep the maximum — this is the dominant shelter source.
+                // A closer obstacle always wins if it subtends a larger angle, which is physically correct (it blocks more of the wave fetch).
+                if (angleDeg > maxAngleDeg)
+                    maxAngleDeg = angleDeg;
+
+                // Early exit: a very close high obstacle fully shelters — no need to look further since nothing beyond can add more shelter
+                if (maxAngleDeg >= SHELTER_FULL) break;
+            }
+
+            // Map max angle → shelter [0, 1]
+            chanG[y * CM_W + x] = std::clamp( (maxAngleDeg - SHELTER_NONE) / (SHELTER_FULL - SHELTER_NONE), 0.f, 1.f );
+        }
+
+    return chanG;
+}
+void GenerateControlMap()
+{
+    static const char* OUTPUT_PATH = "Resources/Textures/control_map.png";
+
+    if (filesystem::exists(OUTPUT_PATH))
+        return;
+	RenderLoadingScreen("Generating map...");
+
+    CM_ComputeBounds();
+
+    // Rasterise presence + heightmap in one pass
+    vector<uint8_t> presence(CM_W * CM_H, 0);
+    std::fill(g_Heightmap.begin(), g_Heightmap.end(), 0.f);
+
+    int n = 0;
+    for (auto& t : g_vTerrains)
+    {
+        //printf("[ControlMap] Rasterising %d/%zu  %s\n", ++n, g_vTerrains.size(), t.name.c_str());
+        CM_RasteriseIsland(presence, t);   // fills presence (XZ only)
+        CM_BuildHeightmap();               // fills g_Heightmap (with Y)
+    }
+
+    // Channel R: shoreline foam
+    auto chanR = CM_DistanceField(presence, 60.f);
+
+    // Channel G: wave shelter from wind direction
+    //printf("[ControlMap] Computing shelter (wind %.1f, %.1f)...\n", g_Wind.x, g_Wind.y);
+    auto chanG = CM_ComputeShelter(g_Wind);
+
+    // Pack and save
+    vector<uint8_t> rgb(CM_W * CM_H * 3, 0);
+    for (int i = 0; i < CM_W * CM_H; i++)
+    {
+        rgb[i * 3 + 0] = (uint8_t)(chanR[i] * 255.f);
+        rgb[i * 3 + 1] = (uint8_t)(chanG[i] * 255.f);
+        rgb[i * 3 + 2] = 0;
+    }
+    stbi_write_png(OUTPUT_PATH, CM_W, CM_H, 3, rgb.data(), CM_W * 3);
+    //printf("[ControlMap] Done.\n");
 }
 void LoadShips()
 {
@@ -5991,13 +6499,13 @@ void SetShip(int n)
 }
 void SetMeteo(int n)
 {
-    auto& rng = [&]() -> std::mt19937& {
-        static std::mt19937 gen(std::random_device{}());
+    auto& rng = [&]() -> mt19937& {
+        static mt19937 gen(random_device{}());
         return gen;
         }();
 
     auto frand = [&](float lo, float hi) {
-        return std::uniform_real_distribution<float>(lo, hi)(rng);
+        return uniform_real_distribution<float>(lo, hi)(rng);
         }; 
     
     switch (n)
@@ -6318,7 +6826,8 @@ void InitScene()
     // Terrain
     LoadTerrains();
     LoadPortContour();
-    
+    GenerateControlMap();
+
     // Markup
     g_Markup = make_unique<Markup>(g_Device, g_RenderPassScene, g_SwapChain->extent, L"Resources/Terrains/Islands/Markup-BHH.xml");
     g_Lighthouses = make_unique<Lighthouses>(g_Device, g_RenderPassScene, g_SwapChain->extent, L"Resources/Terrains/Islands/Lighthouses-BHH.xml");

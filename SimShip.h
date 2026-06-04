@@ -2,7 +2,7 @@
 This work is licensed under a Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License
 http://creativecommons.org/licenses/by-nc-nd/4.0/ */
 
-// 1. PROJET
+// 1. PROJECT
 #include "Utility.h"
 #include "Timer.h"
 #include "Camera.h"
@@ -270,6 +270,11 @@ float XMAX = std::numeric_limits<float>::lowest();
 float ZMIN = std::numeric_limits<float>::max();
 float ZMAX = std::numeric_limits<float>::lowest(); 
 #endif
+
+const int					CM_W					= 8192;
+const int					CM_H					= 4096;
+float						CM_minX, CM_minZ, CM_sizeX, CM_sizeZ;		// World-space bounds (OpenGL XZ, in metres) — filled by CM_ComputeBounds
+vector<float>				g_Heightmap;
 
 // SOUNDS ////////////////////////////////////////
 SoundManager			  * SoundManager::instance		= nullptr;		// Initialization of the static pointer (otherwise, place it in a Sound.cpp file)

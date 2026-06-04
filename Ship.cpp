@@ -1561,6 +1561,7 @@ void Ship::Update(float time)
     // Preparation
     UpdateWorldMatrix();
     TransformVertices();
+    GetHeightMax();
     // Computation
     GetHeightOfAllVertices();
     GetTrisUnderWater();
@@ -1587,7 +1588,8 @@ void Ship::Update(float time)
     // GPU
     if (bPressure) 
         UpdatePressureMesh();
-    UpdateWakeMesh();
+	if (ship.nPropeller == 1)   UpdateWakeMeshSinglePropeller();
+    else                        UpdateWakeMeshDoublePropeller();
 }
 void Ship::UpdateWorldMatrix()
 {
@@ -1604,6 +1606,17 @@ void Ship::TransformVertices()
 {
     for (size_t i = 0; i < mvVerticesInitial.size(); i++)
         mvVertices[i] = vec3(mWorld * vec4(mvVerticesInitial[i], 1.0f));
+}
+void Ship::GetHeightMax()
+{
+    const size_t FFT_SIZE2 = mOcean->FFT_SIZE * mOcean->FFT_SIZE * 4;
+    const float* __restrict p = pDisplacement;    // SIMD-friendly : let the compiler auto-vectorize with /O2 or -O2
+    float h = -FLT_MAX;
+
+    for (size_t i = 1; i < FFT_SIZE2; i += 4)
+        h = p[i] > h ? p[i] : h;
+
+    mHeightMax = h;
 }
 vec3 Ship::GetVerticeAtMeshIndex(int x, int z)
 {
@@ -1822,17 +1835,30 @@ int Ship::GetHeightSlow(vec3& pos)
 void Ship::GetHeightOfAllVertices()
 {
     int nSearch = 0;
+    int nSkipped = 0;
     vec3 pWater;
 
     for (unsigned int i = 0; i < mvVertices.size(); i++)
     {
+        // Early-exit: if the vertex is clearly above the maximum wave height, skip the expensive water height search — it cannot be submerged.
+        if (mvVertices[i].y > mHeightMax)
+        {
+            mvVertSubmerged[i] = 0;
+            mvVertWaterHeight[i] = mvVertices[i].y - mHeightMax; // approximate lower bound
+            nSkipped++;
+            continue;
+        }
+
         pWater = mvVertices[i];
         nSearch += GetHeightFast(pWater);
-        mvVertSubmerged[i] = (mvVertices[i].y < pWater.y) ? 1 : 0;  // 0 = under water, 1 = above
+        mvVertSubmerged[i] = (mvVertices[i].y < pWater.y) ? 1 : 0;
         mvVertWaterHeight[i] = mvVertices[i].y - pWater.y;
     }
+
     if (mvVertices.size())
         WaterSearch = int(nSearch / mvVertices.size());
+
+    //cout << "Skipped: " << nSkipped << " / " << mvVertices.size() << endl;
 }
 void Ship::GetTrisUnderWater()
 {
@@ -1847,6 +1873,7 @@ void Ship::GetTrisUnderWater()
         }
     }
 
+    // Only if the hull mesh is visible
     if (bHullMesh)
     {
         // Color of the triangles
@@ -3476,7 +3503,138 @@ float calcAlpha(float pointTime, float now)
     float logAlpha = 1.0f - log(t + 1.0f) / log(2.0f);
     return glm::clamp(logAlpha, 0.0f, 1.0f);
 }
-void Ship::UpdateWakeMesh()
+void Ship::UpdateWakeMeshSinglePropeller()
+{
+    // Add point to wake every 100 frames
+    static int compteurSillage = 0;
+    compteurSillage++;
+    if (compteurSillage % 100 == 0)
+    {
+        sFoamPts sfp;
+        sfp.pos = TransformPosition(mWakePivot);
+        sfp.pos.y = 1.0f;
+        sfp.time = glfwGetTime();
+        vWakePoints.push_back(sfp);
+        // Cleaning to not exceed a limit
+        if (vWakePoints.size() > 500) vWakePoints.erase(vWakePoints.begin());
+        compteurSillage = 0;
+    }
+
+    // Temporarily adds the current position
+    sFoamPts sfp;
+    sfp.pos = TransformPosition(mWakePivot);
+    sfp.pos.y = 1.0f;
+    sfp.time = glfwGetTime();
+    vWakePoints.push_back(sfp);
+
+    size_t n = vWakePoints.size();
+    if (n < 2) return;
+
+    mWakeSideLeft.resize(n);
+    mWakeSideRight.resize(n);
+    vWakeVertices.reserve((n - 1) * 12);// pre-allocate the exact count
+
+    float widthHalf = (mWidth * ship.WakeWidth) * 0.5f;
+
+    // Calculation of the “joined” side ends
+    for (size_t i = 0; i < n; ++i)
+    {
+        vec3 p = vWakePoints[i].pos;
+
+        // Forward (next), backward (prev)
+        vec2 dirPrev, dirNext;
+
+        if (i == 0)     dirPrev = glm::normalize(vec2(vWakePoints[i + 1].pos.x - p.x, vWakePoints[i + 1].pos.z - p.z));
+        else            dirPrev = glm::normalize(vec2(p.x - vWakePoints[i - 1].pos.x, p.z - vWakePoints[i - 1].pos.z));
+        if (i == n - 1) dirNext = glm::normalize(vec2(p.x - vWakePoints[i - 1].pos.x, p.z - vWakePoints[i - 1].pos.z));
+        else            dirNext = glm::normalize(vec2(vWakePoints[i + 1].pos.x - p.x, vWakePoints[i + 1].pos.z - p.z));
+
+        // Normals to the left of each segment
+        vec2 nPrev(-dirPrev.y, dirPrev.x);
+        vec2 nNext(-dirNext.y, dirNext.x);
+
+        // Standard bisector (except in the case of very tight turns)
+        vec2 bisec = glm::normalize(nPrev + nNext);
+        float bisecLen = glm::length(nPrev + nNext);
+        if (bisecLen < 1e-4f) // super acute angle, we take one of the normals
+            bisec = nPrev;
+
+        // Corrects the "big miter" if the turn is very tight (prevents crazy points)
+        float dotDir = glm::dot(dirPrev, dirNext);
+
+        // Calculates the distance to neighbors to adjust the width
+        float dist = 0.0f;
+        if (i + 1 < n)
+            dist = glm::distance(vec2(p.x, p.z), vec2(vWakePoints[i + 1].pos.x, vWakePoints[i + 1].pos.z));
+        else if (i > 0)
+            dist = glm::distance(vec2(p.x, p.z), vec2(vWakePoints[i - 1].pos.x, vWakePoints[i - 1].pos.z));
+
+        // Threshold for “too close” points
+        float adjustedWidthHalf = widthHalf;
+        float threshold = 0.25f;
+        if (dist < threshold)
+            adjustedWidthHalf = 0.05f; // Minimum width
+
+        // Use adjustedWidthHalf for the following
+        float miterLen = adjustedWidthHalf / glm::max(glm::dot(bisec, nPrev), 0.2f); // clamp min
+
+        vec3 left = p + vec3(bisec.x, 0.0f, bisec.y) * miterLen;
+        vec3 right = p - vec3(bisec.x, 0.0f, bisec.y) * miterLen;
+
+        mWakeSideLeft[i] = left;
+        mWakeSideRight[i] = right;
+    }
+
+    // Generation of triangles (2 per segment)
+    vWakeVertices.clear();
+    float uv_v = 0.0f, dv = 1.0f / n;
+
+    float now = glfwGetTime();
+
+    // 3 trails (left and right with foam and center without foam)
+    for (size_t i = 0; i + 1 < n; ++i)
+    {
+        float v0 = uv_v, v1 = uv_v + dv;
+
+        float alpha0 = calcAlpha(vWakePoints[i].time, now);
+        float alpha1 = calcAlpha(vWakePoints[i + 1].time, now);
+
+        vec3 center0 = vWakePoints[i].pos;       // current centre
+        vec3 center1 = vWakePoints[i + 1].pos;   // next centre
+
+        // Triangle left-center
+        vWakeVertices.push_back({ mWakeSideLeft[i],     {0.0f, v0}, 0.0f }); // outer left  → transparent
+        vWakeVertices.push_back({ center0,              {0.5f, v0}, alpha0 }); // center      → opaque
+        vWakeVertices.push_back({ mWakeSideLeft[i + 1],   {0.0f, v1}, 0.0f }); // outer left  → transparent
+
+        // Triangle center-left
+        vWakeVertices.push_back({ mWakeSideLeft[i + 1],   {0.0f, v1}, 0.0f });
+        vWakeVertices.push_back({ center0,              {0.5f, v0}, alpha0 });
+        vWakeVertices.push_back({ center1,              {0.5f, v1}, alpha1 });
+
+        // Triangle center-right
+        vWakeVertices.push_back({ center0,              {0.5f, v0}, alpha0 });
+        vWakeVertices.push_back({ mWakeSideRight[i],    {1.0f, v0}, 0.0f }); // outer right → transparent
+        vWakeVertices.push_back({ center1,              {0.5f, v1}, alpha1 });
+
+        // Triangle right-center
+        vWakeVertices.push_back({ center1,              {0.5f, v1}, alpha1 });
+        vWakeVertices.push_back({ mWakeSideRight[i],    {1.0f, v0}, 0.0f });
+        vWakeVertices.push_back({ mWakeSideRight[i + 1],  {1.0f, v1}, 0.0f });
+        uv_v += dv;
+    }
+
+    // Remove the temporary stitch after use
+    vWakePoints.pop_back();
+
+    // Update
+    if (vWakeVertices.size() > 3)
+    {
+        mWakeMesh->UpdateVertices(vWakeVertices);
+        mWakeMesh->UpdateTextureVertices(vWakeVertices);
+    }
+}
+void Ship::UpdateWakeMeshDoublePropeller()
 {    
     // Add point to wake every 100 frames
     static int compteurSillage = 0;
@@ -4020,7 +4178,7 @@ void Ship::UpdateSpray(int iCurrentFrame)
 
     float intensity1, intensity2;
 
-    // Lambda function to emit multiple interpolated particles between two points
+    // Camber function to emit multiple interpolated particles between two points
     auto EmitInterpolatedSpray = [&](const sSprayPt& pt1, const sSprayPt& pt2, float intensity1, float intensity2)
         {
             for (int j = 0; j <= ship.SprayMultiplier; ++j)

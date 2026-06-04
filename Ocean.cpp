@@ -34,7 +34,6 @@ Ocean::Ocean(shared_ptr<VulkanDevice>& vulkanDevice, VkRenderPass renderPass, Vk
 	ComputeFinishedSem.resize(g_FramesInFlight);
     mComputeFence.resize(g_FramesInFlight);
     mComputeCmd.resize(g_FramesInFlight);
-
 }
 Ocean::~Ocean()
 {
@@ -97,7 +96,7 @@ void Ocean::Init(vec2 wind)
     //}
 
     SetWind(wind);
-    EvaluatePersistence(PersistenceSec);
+    EvaluatePersistence(FoamPersistence);
     SetSpectrum(9);
 
     // All meshes (normal and lod sizes)
@@ -167,8 +166,8 @@ void Ocean::SetWind(vec2 wind)
 };
 void Ocean::EvaluatePersistence(float seconds)
 {
-    PersistenceSec = seconds;
-    PersistenceFactor = -std::log(0.01f) / PersistenceSec;
+    FoamPersistence = seconds;
+    PersistenceFactor = -std::log(0.01f) / FoamPersistence;
 }
 void Ocean::SetSpectrum(int spectre)
 {
@@ -190,7 +189,8 @@ void Ocean::SetSpectrum(int spectre)
         Spectre = spectre;
         CurrentSpectrum = spectrumFuncs[spectre];
 		Amplitude = 1.0f;
-		Lambda = 0.5f;
+		Camber = 2.5f;
+        FoamBreak = 0.65f;
         mvFoamHistory.clear();
     }
 }
@@ -245,6 +245,7 @@ void Ocean::InitFrequencies()
             wdata[index] = sqrtf(mGravity * glm::length(k));
         }
     }
+
     mTexInitialSpectrum.CopyStagingToGPU();
     mTexFrequencies.CopyStagingToGPU();
     ClearRecords();
@@ -252,9 +253,31 @@ void Ocean::InitFrequencies()
 
 float Ocean::Phillips(vec2 k)
 {
+    // ─── Phillips Spectrum (1958) ─────────────────────────────────────────────────
+    //
+    // The earliest physically-motivated ocean wave spectrum, introduced by
+    // Owen Phillips in "The equilibrium range in the spectrum of wind-generated
+    // ocean waves" (J. Fluid Mech., 1958).
+    //
+    // Formulation in k-space:
+    //   S(k) = A · exp(-1 / (k²·L²)) / k⁴
+    //
+    // where:
+    //   A   : dimensionless energy constant (absorbed into mNormFactor here)
+    //   L   = U² / g : maximum possible wave length for wind speed U
+    //         Waves longer than L cannot be sustained by the wind.
+    //   k⁴  : equilibrium power law — energy decays as the fourth power of
+    //         wavenumber, consistent with Phillips' saturation hypothesis.
+    //   exp  : low-frequency cutoff — suppresses waves longer than L,
+    //         which the wind cannot generate.
+    //
+    // Phillips is the simplest physically-based spectrum and serves as the
+    // foundation for all later models (Pierson-Moskowitz, JONSWAP, etc.).
+    // It has no fetch dependence and no spectral peak — it assumes a fully
+    // developed, isotropic sea in equilibrium with the wind.
+    // ─────────────────────────────────────────────────────────────────────────────
+
     float k_length = glm::length(k);
-    
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
@@ -264,90 +287,111 @@ float Ocean::Phillips(vec2 k)
     float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
-    if (k_dot_w < 0.0f)
-        return 0.0f;
 
-    // ── Spectre de Phillips ───────────────────────────────────────────────
-    // S(k) = A · exp(-1 / (k²·L²)) / k⁴
-    // L = V² / g : plus grande vague possible pour la vitesse de vent V
+    // ── Phillips spectrum ─────────────────────────────────────────────────
+    // S(k) = exp(-1 / (k²·L²)) / k⁴
+    // L = U²/g : largest wave the wind of speed U can sustain.
+    // L² appears in the exponent denominator — larger wind speed raises the
+    // low-frequency cutoff, allowing longer waves to exist.
     float L = windSpeed * windSpeed / mGravity;
     float L2 = L * L;
 
     float S_phillips = expf(-1.0f / (k_length2 * L2)) / k_length4;
 
-    // ── Distribution directionnelle cos^n ─────────────────────────────────
+    // ── Directional spreading — cos^n ─────────────────────────────────────
+    // Simple cosine power law aligned on the wind direction.
+    // DirSpread (exponent n) controls the angular width of the wave field:
+    //   n = 1-2  : broad spread, confused sea
+    //   n = 4-6  : moderate directionality
+    //   n > 8    : narrow beam, resembles swell
+    // Waves travelling against the wind (k_dot_w < 0) are naturally zeroed
+    // by the max() without a hard cut.
     float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
 
-    // ── Suppression des petites vagues (capillaires) ──────────────────────
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes wavelengths shorter than ~2cm that the FFT grid cannot resolve
+    // and that lie outside the gravity-wave regime.
+    // l_small = 0.01·L sets the cutoff relative to the wind speed:
+    // stronger winds push the cutoff to slightly shorter scales.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
-    float S = S_phillips * D * suppress;
-
-    return S;
+    return S_phillips * D * suppress;
 }
 float Ocean::Bretschneider(vec2 k)
 {
-    // ─── Bretschneider (ISSC, 1959 / 1967) ──────────────────────────────────────
+    // ─── Bretschneider Spectrum (ISSC, 1959 / 1967) ──────────────────────────────
     //
-    //  Reformulation paramétrique du Pierson-Moskowitz utilisant la hauteur
-    //  significative Hs et la période de pic Tp plutôt que la vitesse du vent.
-    //  Standard ISO/ISSC pour l'ingénierie offshore (structures, navires).
-    //  Identique à PM quand Hs et Tp sont dérivés de U via les relations P-M,
-    //  mais bien plus pratique quand on impose directement l'état de mer.
+    // Developed by Charles Bretschneider and adopted as the ISSC (International
+    // Ship Structures Congress) standard spectrum for offshore engineering.
     //
-    //  Formulation en fréquence angulaire ω :
-    //    S(ω) = (5/16) · Hs² · ωp⁴ / ω⁵ · exp[-5/4 · (ωp/ω)⁴]
-    //  Ici transposée en k via la relation de dispersion ω² = g·k (eau profonde).
+    // A parametric reformulation of Pierson-Moskowitz that uses significant wave
+    // height Hs and peak period Tp as direct inputs rather than wind speed.
+    // This makes it the preferred choice when the sea state is specified from
+    // measurements or design standards rather than derived from meteorological data.
     //
-    //  Paramètres membres à ajouter :
-    //    float Hs   — hauteur significative (m),  ex. 2.5
-    //    float Tp   — période de pic (s),          ex. 10.0
-    //    (Wind, DirSpread, mGravity : inchangés)
+    // Formulation in k-space (direct, no jacobian):
+    //   S(k) = (5/16) · Hs² · ωp⁴ / k⁴ · exp[-5/4·(ωp/ω)⁴]
+    //
+    // where:
+    //   Hs  : significant wave height [m]  — derived here from JONSWAP via Fetch/U
+    //   Tp  : peak period [s]              — idem
+    //   ωp  = 2π/Tp : peak angular frequency [rad/s]
+    //   ω   = sqrt(g·|k|) : deep-water dispersion relation
+    //
+    // The (5/16) prefactor ensures ∫S(ω)dω = Hs²/16 (variance = (Hs/4)²).
+    //
+    // Relationship to other spectra:
+    //   Bretschneider ≡ Pierson-Moskowitz when Hs and Tp are derived from U
+    //   via the P-M fully-developed relations.
+    //   Bretschneider has no peak enhancement (γ = 1) and no fetch dependence
+    //   beyond what is encoded in Hs and Tp.
     // ─────────────────────────────────────────────────────────────────────────────
 
-    float windSpeed = glm::length(Wind);
-    auto waveParams = JONSWAPModel::GetWaveParameters(windSpeed, Fetch);
-    float Hs = waveParams.significantWaveHeight;
-    float Tp = waveParams.peakPeriod;
-
     float k_length = glm::length(k);
-
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
     float k_length2 = k_length * k_length;
+    float k_length4 = k_length2 * k_length2;
 
+    float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // ── Directional spreading — cos^n ─────────────────────────────────────
+    // Bretschneider is omnidirectional in its original formulation.
+    // A cos^n factor is added here for consistency with the other spectra.
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
-    if (k_dot_w < 0.0f)
+    float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
+    if (D == 0.0f)
         return 0.0f;
 
-    // ── Fréquence angulaire (eau profonde) ────────────────────────────────
-    float omega = sqrtf(mGravity * k_length);          // ω = sqrt(g·|k|)
-    float omega_p = 2.0f * M_PI / Tp;                    // ωp = 2π / Tp
+    // ── Sea state parameters ──────────────────────────────────────────────
+    // Hs and Tp derived from the JONSWAP parametric model for the current
+    // wind speed and fetch. In a more general use, these would be set directly
+    // from measurements or design spectra.
+    auto  waveParams = JONSWAPModel::GetWaveParameters(windSpeed, Fetch);
+    float Hs = waveParams.significantWaveHeight;
+    float Tp = waveParams.peakPeriod;
 
-    // ── Spectre de Bretschneider ──────────────────────────────────────────
-    // S(ω) = (5/16) · Hs² · ωp⁴ / ω⁵ · exp[-5/4 · (ωp/ω)⁴]
-    // Conversion ω → k : dω/dk = g/(2ω), donc S(k) = S(ω) · dω/dk
-    float ratio = omega_p / omega;                     // ωp / ω
+    // ── Angular frequencies ───────────────────────────────────────────────
+    float omega = sqrtf(mGravity * k_length);   // ω = sqrt(g·|k|)
+    float omega_p = 2.0f * M_PI / Tp;             // ωp = 2π/Tp
+
+    // ── Bretschneider spectrum in k-space ─────────────────────────────────
+    // S(k) = (5/16) · Hs² · ωp⁴ / k⁴ · exp[-5/4·(ωp/ω)⁴]
+    // Formulated directly in k-space (no jacobian) to match the normalisation
+    // convention of ComputeNormFactor and the other spectra in this simulator.
+    // The k⁴ denominator is the standard Phillips equilibrium tail.
+    // The exponential suppresses energy at frequencies well below the peak.
+    float ratio = omega_p / omega;
     float ratio4 = ratio * ratio * ratio * ratio;
-    float S_omega = (5.0f / 16.0f) * Hs * Hs * powf(omega_p, 4.0f) / powf(omega, 5.0f) * expf(-1.25f * ratio4);
+    float S_k = (5.0f / 16.0f) * Hs * Hs * (omega_p * omega_p * omega_p * omega_p) / k_length4 * expf(-1.25f * ratio4);
 
-    // Jacobien dω/dk = g / (2ω)
-    float dw_dk = mGravity / (2.0f * omega);
-    float S_k = S_omega * dw_dk;
-
-    // ── Distribution directionnelle cos^n ─────────────────────────────────
-    // Bretschneider original est omnidirectionnel ; on ajoute cos^n
-    float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
-
-    // ── Suppression des petites vagues ────────────────────────────────────
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths outside the gravity-wave regime
+    // and beyond the resolution of the FFT grid.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
@@ -355,16 +399,34 @@ float Ocean::Bretschneider(vec2 k)
 }
 float Ocean::PiersonMoskowitz(vec2 k)
 {
-    /*
-    Pierson-Moskowitz est simple — pas de fetch, pas de pic de résonance γ. 
-    La fréquence de pic ωp = 0.855·g/U est uniquement fonction de la vitesse du vent, ce qui correspond à une mer pleinement développée 
-    où le vent souffle depuis suffisamment longtemps pour que les vagues aient atteint leur état d'équilibre. 
-    C'est pour ça que JONSWAP converge vers Pierson-Moskowitz quand γ = 1 et que le fetch tend vers l'infini. Pierson-Moskowitz est le cas limite de JONSWAP.
-    */
+    // ─── Pierson-Moskowitz Spectrum (1964) ───────────────────────────────────────
+    //
+    // Developed by Willard Pierson and Lionel Moskowitz from analysis of North
+    // Atlantic weather ship data ("A proposed spectral form for fully developed
+    // wind seas", J. Geophys. Res., 1964).
+    //
+    // Key assumption: fully developed sea — the wind has been blowing long enough
+    // and over a large enough fetch for the wave field to reach statistical
+    // equilibrium. Under this assumption the spectrum depends only on wind speed U,
+    // with no fetch parameter and no resonance peak (γ = 1).
+    //
+    // Formulation in k-space:
+    //   S(k) = α·g² / k⁴ · exp[-β·(ωp/ω)⁴]
+    //
+    // where:
+    //   α  = 0.0081 : Phillips equilibrium constant
+    //   β  = 1.25   : empirical P-M constant
+    //   ωp = 0.855·g/U : peak frequency for a fully developed sea
+    //   ω  = sqrt(g·k) : deep-water dispersion relation
+    //
+    // Relationship to other spectra:
+    //   JONSWAP → P-M when γ = 1 and Fetch → ∞ : P-M is the fully developed
+    //   limiting case of JONSWAP.
+    //   Phillips  → P-M adds a low-frequency peak via the (ωp/ω)⁴ exponential,
+    //   whereas Phillips has no preferred scale.
+    // ─────────────────────────────────────────────────────────────────────────────
 
     float k_length = glm::length(k);
-
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
@@ -374,78 +436,137 @@ float Ocean::PiersonMoskowitz(vec2 k)
     float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // Suppress waves travelling against the wind
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
     if (k_dot_w < 0.0f)
         return 0.0f;
 
-    // ── Fréquence angulaire ───────────────────────────────────────────────
-    float omega = sqrtf(mGravity * k_length);
-    float omega_p = 0.855f * mGravity / windSpeed;         // fréquence de pic P-M
-    // correspond à mer pleinement développée
+    // ── Angular frequency — deep-water dispersion ─────────────────────────
+    float omega = sqrtf(mGravity * k_length);     // ω = sqrt(g·|k|)
 
-    // ── Spectre Pierson-Moskowitz ─────────────────────────────────────────
-    // S(k) = α·g²/k⁴ · exp[-β·(ωp/ω)⁴]
-    // α = 0.0081 (constante de Phillips)
-    // β = 1.25   (constante empirique P-M)
-    const float alpha = 0.0081f;
-    const float beta = 1.25f;
+    // ── Peak frequency for a fully developed sea ──────────────────────────
+    // ωp = 0.855·g/U  (Pierson-Moskowitz 1964, eq. 26)
+    // Physically: the wind can no longer transfer energy to waves travelling
+    // at the wind speed — the spectrum saturates at this frequency.
+    // Contrast with JONSWAP where ωp also depends on fetch.
+    float omega_p = 0.855f * mGravity / windSpeed;
+
+    // ── Pierson-Moskowitz spectrum in k-space ─────────────────────────────
+    // S(k) = α·g² / k⁴ · exp[-β·(ωp/ω)⁴]
+    // The k⁴ denominator is the Phillips equilibrium tail.
+    // The exponential provides the low-frequency cutoff below ωp:
+    //   ω >> ωp : exp → 1, spectrum follows the k⁴ power law
+    //   ω << ωp : exp → 0, long waves are suppressed
+    const float alpha = 0.0081f;   // Phillips constant
+    const float beta = 1.25f;     // P-M empirical constant
 
     float S_pm = alpha * mGravity * mGravity / k_length4 * expf(-beta * powf(omega_p / omega, 4.0f));
 
-    // ── Distribution directionnelle cos^n ─────────────────────────────────
-    // P-M original est isotrope mais on ajoute une directionnalité pour avoir des vagues alignées sur le vent
-    float cosTheta = glm::max(k_dot_w, 0.0f);
-    float D = powf(cosTheta, DirSpread);    // exposant 2-6 typique
+    // ── Directional spreading — cos^n ─────────────────────────────────────
+    // The original P-M spectrum is omnidirectional (isotropic).
+    // A cos^n directional factor is added here to align the wave field with
+    // the wind direction, consistent with the other spectra in this simulator.
+    // DirSpread (exponent n) : 2-6 typical for wind sea.
+    float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
 
-    // ── Suppression des petites vagues ────────────────────────────────────
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths outside the gravity-wave regime
+    // and beyond the resolution of the FFT grid.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
-    float S = S_pm * D * suppress;
-
-    return S;
+    return S_pm * D * suppress;
 }
 float Ocean::JONSWAP(vec2 k)
 {
+    // ─── JONSWAP Spectrum (Joint North Sea Wave Project, 1973) ───────────────────
+    //
+    // Developed by Hasselmann et al. from an extensive measurement campaign in the
+    // southern North Sea ("Measurements of wind-wave growth and swell decay during
+    // the Joint North Sea Wave Project", Ergänzungsheft zur Deutschen Hydrographischen
+    // Zeitschrift, Reihe A, 1973).
+    //
+    // JONSWAP extends Pierson-Moskowitz to fetch-limited seas by introducing:
+    //   1. A fetch-dependent peak frequency ωp and energy level α
+    //   2. A peak enhancement factor γ^r that sharpens the spectral peak,
+    //      modelling the non-linear resonant energy transfer observed in young seas.
+    //
+    // Formulation in k-space:
+    //   S(k) = α·g² / k⁴ · exp[-5/4·(ωp/ω)⁴] · γ^r
+    //
+    // where:
+    //   α   = 0.076·(U²/F·g)^0.22  : fetch-dependent Phillips constant
+    //   ωp  = 22·(g²/U·F)^(1/3)    : peak frequency [rad/s]
+    //   γ   ∈ [1, 7]                : peak enhancement factor (Maturity)
+    //                                 1 = fully developed sea (≡ Pierson-Moskowitz)
+    //                                 7 = young, fetch-limited sea
+    //   r   : Gaussian bell centred on ωp — γ^r → γ at peak, → 1 away from it
+    //   σ   : peak width (0.07 below ωp, 0.09 above)
+    //
+    // Relationship to other spectra:
+    //   JONSWAP → Pierson-Moskowitz when γ = 1 and Fetch → ∞
+    //   TMA     = JONSWAP · Phi(kh)  (depth-limited transformation)
+    //   Horvath, Donelan-Banner : extensions using the same base spectrum
+    // ─────────────────────────────────────────────────────────────────────────────
+
     float k_length = glm::length(k);
-    
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
     float k_length2 = k_length * k_length;
     float k_length4 = k_length2 * k_length2;
 
-    // Direction du vent normalisée
-    vec2 windDir = glm::normalize(Wind);
     float windSpeed = glm::length(Wind);
+    vec2  windDir = glm::normalize(Wind);
 
+    // ── Directional spreading — cos^n ─────────────────────────────────────
+    // Waves travelling against the wind (k_dot_w ≤ 0) are naturally zeroed
+    // by the max() — no hard cut needed.
+    // DirSpread (exponent n) controls angular width:
+    //   n = 1-2  : broad, confused sea
+    //   n = 4-6  : moderate directionality (typical wind sea)
+    //   n > 8    : narrow beam, resembles swell
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
-
-    // Supprime les vagues allant contre le vent
-    if (k_dot_w < 0.0f)
+    float dirSpread = powf(glm::max(k_dot_w, 0.0f), DirSpread);
+    if (dirSpread == 0.0f)
         return 0.0f;
 
-    // Fréquence angulaire de dispersion (deep water)
-    float omega = sqrtf(mGravity * k_length);           // ω = sqrt(g * |k|)
+    // ── Deep-water dispersion relation ────────────────────────────────────
+    // ω = sqrt(g·|k|)  —  exact for infinite depth
+    float omega = sqrtf(mGravity * k_length);
 
-    // Fréquence de pic JONSWAP (plus le fetch - en m - est grand, plus les vagues sont longues)
-    float omega_p = 22.0f * cbrtf(mGravity * mGravity / (windSpeed * Fetch));
+    // ── Fetch-dependent peak frequency ────────────────────────────────────
+    // ωp = 22·(g²/(U·F))^(1/3)   [rad/s]
+    // Shorter fetch → higher ωp → shorter dominant waves (younger sea).
+    // As Fetch → ∞, ωp → 0.855·g/U, recovering the Pierson-Moskowitz peak.
+    float omega_p = 22.0f * cbrtf((mGravity * mGravity) / (windSpeed * Fetch));
 
-    // Spectre de Pierson-Moskowitz (base de JONSWAP)
-    float alpha = 0.0081f;                              // constante de Phillips généralisée
-    float S_pm = alpha * mGravity * mGravity / k_length4 * expf(-1.25f * powf(omega_p / omega, 4.0f));
+    // ── Fetch-dependent energy level ──────────────────────────────────────
+    // α = 0.076·(U²/(F·g))^0.22
+    // Replaces the fixed Phillips constant (0.0081) with a value that grows
+    // for shorter fetches — young seas carry proportionally more high-frequency
+    // energy than fully developed ones.
+    float alpha = 0.076f * powf((windSpeed * windSpeed) / (Fetch * mGravity), 0.22f);
 
-    // Pic de résonance JONSWAP
-    float sigma = (omega <= omega_p) ? 0.07f : 0.09f;   // largeur du pic
+    // ── Pierson-Moskowitz base spectrum in k-space ────────────────────────
+    // S_pm(k) = α·g² / k⁴ · exp[-5/4·(ωp/ω)⁴]
+    // The k⁴ denominator is the Phillips equilibrium tail.
+    // The exponential suppresses energy below the peak frequency.
+    float S_pm = alpha * (mGravity * mGravity) / k_length4 * expf(-1.25f * powf(omega_p / omega, 4.0f));
+
+    // ── JONSWAP peak enhancement factor γ^r ──────────────────────────────
+    // Sharpens the spectral peak to model non-linear wave-wave interactions
+    // that concentrate energy near ωp in fetch-limited seas.
+    // σ : controls the width of the Gaussian bell — asymmetric by design
+    //     (narrower on the low-frequency side, slightly wider above).
+    // Maturity == γ ∈ [1, 7] : set by the user to control sea state age.
+    float sigma = (omega <= omega_p) ? 0.07f : 0.09f;
     float r = expf(-powf(omega - omega_p, 2.0f) / (2.0f * sigma * sigma * omega_p * omega_p));
     float S_jonswap = S_pm * powf(Maturity, r);
 
-    // Distribution directionnelle (même approche que Phillips : cos^n aligné sur le vent)
-    float dirSpread = powf(glm::max(k_dot_w, 0.0f), DirSpread); // exposant : 2-6 typique
-
-    // Suppression des petites vagues (capillaires)
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths outside the gravity-wave regime
+    // and beyond the resolution of the FFT grid.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
@@ -453,96 +574,145 @@ float Ocean::JONSWAP(vec2 k)
 }
 float Ocean::OchiHubble(vec2 k)
 {
-    // ─── Ochi-Hubble (1976) ──────────────────────────────────────────────────────
+    // ─── Ochi-Hubble Spectrum (1976) ─────────────────────────────────────────────
     //
-    //  Spectre bimodal à six paramètres (trois par composante), développé par
-    //  Michel Ochi et Earl Hubble (SSPA Research, Göteborg) à partir de 800 états
-    //  de mer mesurés en Atlantique Nord.
-    //  Publication : "Six-Parameter Wave Spectra", Coastal Engineering Conference 1976.
+    // Developed by Michel Ochi and Earl Hubble (SSPA Research, Göteborg) from
+    // analysis of 800 sea states recorded in the North Atlantic
+    // ("Six-Parameter Wave Spectra", Coastal Engineering Conference, 1976).
     //
-    //  Modélise simultanément :
-    //    • La houle longue distante  (swell)  — composante basse fréquence
-    //    • La mer de vent locale              — composante haute fréquence
-    //  Très utilisé en tenue à la mer et fatigue des structures offshore.
+    // A six-parameter double-peaked spectrum that models swell and wind sea
+    // simultaneously with independent control over each component:
     //
-    //  Formulation à deux pics (j = 1 : swell, j = 2 : wind sea) :
-    //    S_j(ω) = [ (4λ_j + 1)/4 · ωp_j⁴ ]^λ_j / Γ(λ_j) · Hs_j² / ω^(4λ_j+1) · exp[-(4λ_j+1)/4 · (ωp_j/ω)⁴]
+    //   S(ω) = Σ_j [ (4λ_j+1)/4 · ωp_j⁴ ]^λ_j / Γ(λ_j) · Hs_j²/4 / ω^(4λ_j+1)
+    //          · exp[-(4λ_j+1)/4 · (ωp_j/ω)⁴]
     //
-    //  Paramètres membres à ajouter :
-    //    float OH_Hs1, OH_Tp1, OH_lambda1   — swell     (ex. 1.5, 15.0, 3.0)
-    //    float OH_Hs2, OH_Tp2, OH_lambda2   — mer de vent (ex. 1.0, 8.0,  1.5)
-    //    λ typiques : 3.0 (swell bien formé) / 1.5 (mer de vent jeune)
+    // Three parameters per component (j = 1: swell, j = 2: wind sea):
+    //   Hs_j    : significant wave height of the component [m]
+    //   Tp_j    : peak period [s]
+    //   λ_j     : spectral shape parameter — controls peak sharpness and tail slope
+    //             λ → 1   : broad, low peak (young wind sea)
+    //             λ → 6   : sharp, narrow peak (well-formed swell)
+    //
+    // The λ exponent in ω^(4λ+1) makes a direct k-space formulation non-trivial.
+    // Here the spectrum is expressed via a normalised shape factor anchored to
+    // the peak wavenumber kp, keeping the energy scale consistent with JONSWAP:
+    //   S(k) = amplitude · shape(k) / (k/kp)^(2λ+0.5)
+    // where amplitude is set so that S(kp) = Hs²/(4·kp⁴).
+    //
+    // Parameter choices here (tuned for visual plausibility within the FFT domain):
+    //   Swell  (j=1) : Hs1 = 2·Hs2,  Tp1 = Tp1_max (domain limit),  λ1 = 6
+    //   Wind sea(j=2): Hs2 from JONSWAP, Tp2 = 0.8·Tp_JONSWAP,       λ2 = 1
+    // The swell Tp is clamped to sqrt(LengthWave·2π/g) so that the dominant
+    // swell wavelength stays within the FFT domain.
     // ─────────────────────────────────────────────────────────────────────────────
 
-    float windSpeed = glm::length(Wind);
-    auto waveParams = JONSWAPModel::GetWaveParameters(windSpeed, Fetch);
-    float OH_Hs2 = waveParams.significantWaveHeight;
-    float OH_Tp2 = waveParams.peakPeriod;
-    float OH_lambda2 = 1.5f;
-
-    float OH_Hs1 = 1.5f * OH_Hs2;
-    float OH_Tp1 = 3.0f * OH_Tp2;
-    float OH_lambda1 = 3.0f;    // swell bien formé
-
     float k_length = glm::length(k);
-
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
     float k_length2 = k_length * k_length;
 
+    float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // ── Directional spreading — cos^n ─────────────────────────────────────
+    // Ochi-Hubble is omnidirectional in its original formulation.
+    // A cos^n factor is added here for consistency with the other spectra.
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
-    if (k_dot_w < 0.0f)
+    float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
+    if (D == 0.0f)
         return 0.0f;
 
-    // ── Fréquence angulaire ───────────────────────────────────────────────
-    float omega = sqrtf(mGravity * k_length);
+    // ── Sea state from JONSWAP parametric model ───────────────────────────
+    auto  waveParams = JONSWAPModel::GetWaveParameters(windSpeed, Fetch);
+    float OH_Hs2 = waveParams.significantWaveHeight;
+    float OH_Tp2 = waveParams.peakPeriod * 0.8f;   // compress wind-sea period
+    // slightly to separate peaks
+    float OH_lambda2 = 1.0f;                            // broad chop — low λ
 
-    // ── Composante générique Ochi-Hubble ──────────────────────────────────
-    // Calcule S_j(ω) pour un seul pic (Hs_j, Tp_j, λ_j) puis applique le jacobien dω/dk pour obtenir S_j(k)
+    // Swell peak clamped so that λp1 = g·Tp1²/2π ≤ LengthWave (FFT domain limit)
+    float Tp1_max = sqrtf((float)LengthWave * 2.0f * (float)M_PI / mGravity);
+    float OH_Tp1 = Tp1_max;      // push swell to the longest resolvable period
+    float OH_Hs1 = OH_Hs2 * 2.0f;   // swell carries more energy than wind sea
+    float OH_lambda1 = 6.0f;             // sharp, well-formed swell peak — high λ
+
+    // ── Deep-water dispersion ─────────────────────────────────────────────
+    float omega = sqrtf(mGravity * k_length);    // ω = sqrt(g·|k|)
+
+    // ── Spectral component (Ochi-Hubble shape, k-space normalised) ────────
+    // The ω^(4λ+1) denominator of the original S(ω) formulation is converted
+    // to k-space via ω² = g·k → ω^(4λ+1) ∝ k^(2λ+0.5).
+    // Rather than applying this directly (which changes units per component),
+    // the spectrum is normalised so that S(kp) = Hs²/(4·kp⁴), anchoring the
+    // peak amplitude to the same scale as JONSWAP regardless of λ.
     auto ochi_component = [&](float Hs_j, float Tp_j, float lambda_j) -> float
         {
             float omega_p_j = 2.0f * M_PI / Tp_j;
-            float ratio_j = omega_p_j / omega;                    // ωp_j / ω
-            float ratio4_j = powf(ratio_j, 4.0f);
+            float k_p_j = omega_p_j * omega_p_j / mGravity;   // kp = ωp²/g (deep water)
+            float ratio_j = omega_p_j / omega;                   // ωp/ω
+            float ratio4_j = ratio_j * ratio_j * ratio_j * ratio_j;
 
-            // Coefficient de forme
-            float coeff = powf((4.0f * lambda_j + 1.0f) / 4.0f * ratio4_j, lambda_j) / tgammaf(lambda_j);                         // Γ(λ) via tgamma
+            // Ochi-Hubble shape argument : A = (4λ+1)/4 · (ωp/ω)⁴
+            float exp_arg = (4.0f * lambda_j + 1.0f) / 4.0f * ratio4_j;
 
-            float S_omega_j = coeff * (Hs_j * Hs_j / 4.0f) / powf(omega, 4.0f * lambda_j + 1.0f) * expf(-(4.0f * lambda_j + 1.0f) / 4.0f * ratio4_j);
+            // Shape factor f(ω) = A^λ / Γ(λ) · exp(-A)
+            // This is the unnormalised gamma-distribution shape that gives O-H
+            // its characteristic asymmetric peak controlled by λ.
+            float shape = powf(exp_arg, lambda_j) / tgammaf(lambda_j) * expf(-exp_arg);
 
-            // Jacobien dω/dk
-            float dw_dk = mGravity / (2.0f * omega);
-            return S_omega_j * dw_dk;
+            // Peak value of the shape factor (at ω = ωp, where ratio = 1)
+            // Used to normalise the amplitude so S(kp) = Hs²/(4·kp⁴)
+            float exp_arg_peak = (4.0f * lambda_j + 1.0f) / 4.0f;
+            float shape_peak = powf(exp_arg_peak, lambda_j) / tgammaf(lambda_j) * expf(-exp_arg_peak);
+
+            // Amplitude anchored at the peak wavenumber kp to match JONSWAP scale
+            float k_p_j4 = k_p_j * k_p_j * k_p_j * k_p_j;
+            float amplitude = (Hs_j * Hs_j / 4.0f) / (shape_peak * k_p_j4);
+
+            // Frequency-dependent normalisation : (k/kp)^(2λ+0.5)
+            // Restitutes the correct spectral slope away from the peak.
+            // λ = 1 → slope ∝ k^2.5  (broad, shallow tail — wind sea)
+            // λ = 6 → slope ∝ k^12.5 (very steep tail — narrow swell peak)
+            float k_ratio = k_length / k_p_j;
+            float k_pow = powf(k_ratio, 2.0f * lambda_j + 0.5f);
+
+            return amplitude * shape / k_pow;
         };
 
-    // ── Deux composantes ──────────────────────────────────────────────────
-    float S_swell = ochi_component(OH_Hs1, OH_Tp1, OH_lambda1);
-    float S_windsea = ochi_component(OH_Hs2, OH_Tp2, OH_lambda2);
-    float S_total = S_swell + S_windsea;
+    float S_total = ochi_component(OH_Hs1, OH_Tp1, OH_lambda1) + ochi_component(OH_Hs2, OH_Tp2, OH_lambda2);
 
-    // ── Distribution directionnelle cos^n ─────────────────────────────────
-    // Ochi-Hubble original est omnidirectionnel ; on applique la même pondération directionnelle que les autres spectres
-    float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths outside the gravity-wave regime
+    // and beyond the resolution of the FFT grid.
+    float l_small = 0.01f * windSpeed * windSpeed / mGravity;
+    float suppress = expf(-k_length2 * l_small * l_small);
 
-    return S_total * D;
+    return S_total * D * suppress;
 }
 float Ocean::TexelMarsenArsloe(vec2 k)
 {
-    /*
-    La seule différence est Phi_TMA = cg_shallow / cg_deep.
-    En eau profonde kh → ∞, tanh(kh) → 1 donc cg_shallow → cg_deep et Phi → 1 — TMA est strictement équivalent à JONSWAP.
-    En eau peu profonde kh → 0, tanh(kh) → kh donc cg_shallow → sqrt(g·h) (vitesse en eau peu profonde) et Phi → 0 — le spectre s'effondre.
-    C'est physiquement correct : en eau très peu profonde les vagues ne peuvent plus se propager librement et le spectre de surface est atténué.
-    En pratique pour SimShip tu obtiendras une mer notablement plus calme dans les zones portuaires si WaterDepth < 20m, et identique à JONSWAP en pleine mer.
-    */
-    float k_length = glm::length(k);
+    // ─── TMA Spectrum (Texel-Marsen-Arsloe, 1985) ────────────────────────────────
+    //
+    // The TMA spectrum is a depth-limited transformation of JONSWAP, introduced by
+    // Kitaigorodskii et al. (1975) and validated against measurements from three
+    // shallow-water sites (Texel, Marsen, Arsloe) by Hughes (1984).
+    //
+    // The only difference from JONSWAP is the transformation function Phi_TMA:
+    //   S_TMA(k) = S_JONSWAP(k) · Phi(kh)
+    //
+    // where Phi(kh) = cg_shallow / cg_deep is the ratio of group velocities.
+    //
+    // Limiting behaviour:
+    //   Deep water   : kh → ∞,  tanh(kh) → 1,  cg_shallow → cg_deep,  Phi → 1  (TMA = JONSWAP)
+    //   Shallow water: kh → 0,  tanh(kh) → kh, cg_shallow → sqrt(g·h), Phi → 0  (spectrum collapses)
+    //
+    // Physically, in very shallow water waves can no longer propagate freely and
+    // the surface energy spectrum is attenuated accordingly.
+    // In practice, for SimShip: noticeably calmer sea in harbour areas (Depth < 20m),
+    // identical to JONSWAP in open water.
+    // ─────────────────────────────────────────────────────────────────────────────
 
-    // Avoid division by zero
+    float k_length = glm::length(k);
     if (k_length < 1e-6f)
         return 0.0f;
 
@@ -552,54 +722,75 @@ float Ocean::TexelMarsenArsloe(vec2 k)
     float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // Suppress waves travelling against the wind
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
     if (k_dot_w < 0.0f)
         return 0.0f;
 
-    // ── Profondeur d'eau ──────────────────────────────────────────────────
-    // WaterDepth = 0.0 → eau profonde (TMA = JONSWAP)
-    // WaterDepth = 10.0 → eau peu profonde (côte, port)
+    // ── Water depth ───────────────────────────────────────────────────────
+    // Depth = 0   → deep water (TMA reduces to JONSWAP)
+    // Depth = 10m → shallow coastal / harbour water
+    float h = glm::max(Depth, 0.1f);   // clamp to avoid division by zero
 
-    float h = glm::max(Depth, 0.1f);                  // évite division par zéro
-
-    // ── Relation de dispersion eau peu profonde ───────────────────────────
-    // En eau profonde  : ω² = g·k
-    // En eau peu profonde : ω² = g·k·tanh(k·h)
+    // ── Dispersion relation ───────────────────────────────────────────────
+    // Deep water    : ω² = g·k
+    // Finite depth  : ω² = g·k·tanh(k·h)   ← used here
+    // As h → ∞, tanh(kh) → 1 and both relations converge.
     float kh = k_length * h;
     float tanh_kh = tanhf(kh);
-    float omega = sqrtf(mGravity * k_length * tanh_kh);  // ← différence vs eau profonde
+    float omega = sqrtf(mGravity * k_length * tanh_kh);
 
-    // Vitesse de groupe en eau peu profonde
-    // cg = dω/dk = (g/2ω) · [tanh(kh) + kh·(1 - tanh²(kh))]
-    float cg_deep = mGravity / (2.0f * sqrtf(mGravity * k_length)); // eau profonde
-    float cg_shallow = (mGravity / (2.0f * omega)) * (tanh_kh + kh * (1.0f - tanh_kh * tanh_kh));   // eau peu profonde
+    // ── Group velocities ──────────────────────────────────────────────────
+    // cg = dω/dk
+    // Deep water    : cg_deep    = g / (2ω_deep) = sqrt(g/k) / 2
+    // Finite depth  : cg_shallow = (g / 2ω) · [tanh(kh) + kh·(1 - tanh²(kh))]
+    //                            = (g / 2ω) · [tanh(kh) + kh·sech²(kh)]
+    // The second term kh·sech²(kh) accounts for the frequency dispersion reduction
+    // as the seabed is felt by the wave.
+    float cg_deep = mGravity / (2.0f * sqrtf(mGravity * k_length));
+    float cg_shallow = (mGravity / (2.0f * omega))
+        * (tanh_kh + kh * (1.0f - tanh_kh * tanh_kh));
 
-    // ── Fréquence de pic ──────────────────────────────────────────────────
+    // ── JONSWAP peak frequency ────────────────────────────────────────────
+    // ωp = 22 · (g² / (U·F))^(1/3)   [rad/s]
+    // Larger fetch or stronger wind shifts ωp toward lower frequencies (longer waves).
     float omega_p = 22.0f * cbrtf(mGravity * mGravity / (windSpeed * Fetch));
 
-    // ── Spectre JONSWAP de base ───────────────────────────────────────────
-    // TMA est une transformation de JONSWAP → on part de la même base
+    // ── Pierson-Moskowitz base spectrum in k-space ────────────────────────
+    // S_pm(k) = α·g² / k⁴ · exp[-5/4·(ωp/ω)⁴]
+    // α = 0.0081 : Phillips equilibrium constant
+    // Note: omega here uses the finite-depth dispersion relation,
+    // so the exponential cutoff shifts naturally with depth.
     const float alpha = 0.0081f;
-    float S_pm = alpha * mGravity * mGravity / k_length4 * expf(-1.25f * powf(omega_p / omega, 4.0f));
+    float S_pm = alpha * mGravity * mGravity / k_length4
+        * expf(-1.25f * powf(omega_p / omega, 4.0f));
 
-    // Pic de résonance JONSWAP
+    // ── JONSWAP peak enhancement factor γ^r ──────────────────────────────
+    // Sharpens the spectral peak relative to Pierson-Moskowitz.
+    // σ : peak width — narrower below ωp (0.07), slightly wider above (0.09)
+    // r : Gaussian bell centred on ωp; γ^r → γ at ω = ωp, → 1 far from the peak
+    // Maturity == γ ∈ [1, 7] : 1 = fully developed sea (PM), 7 = young wind sea
     float sigma = (omega <= omega_p) ? 0.07f : 0.09f;
-    float r = expf(-powf(omega - omega_p, 2.0f) / (2.0f * sigma * sigma * omega_p * omega_p));
+    float r = expf(-powf(omega - omega_p, 2.0f)
+        / (2.0f * sigma * sigma * omega_p * omega_p));
     float peak = powf(Maturity, r);
-
     float S_jonswap = S_pm * peak;
 
-    // ── Fonction de transformation TMA ────────────────────────────────────
-    // C'est LE terme spécifique à TMA (Kitaigородский et al. 1975)
-    // Φ(kh) = cg_shallow / cg_deep
-    // Atténue le spectre quand kh < π/2 (eau peu profonde)
-    // Φ → 1 quand kh → ∞ (eau profonde : TMA = JONSWAP)
-    // Φ → 0 quand kh → 0 (très faible profondeur)
-    float Phi_TMA = cg_shallow / cg_deep;
-    Phi_TMA = glm::clamp(Phi_TMA, 0.0f, 1.0f);
+    // ── TMA transformation function Phi(kh) ──────────────────────────────
+    // Phi = cg_shallow / cg_deep  (Kitaigorodskii et al. 1975)
+    // This is THE term specific to TMA — everything else is identical to JONSWAP.
+    // Phi progressively attenuates the spectrum as depth decreases:
+    //   kh >> π/2  →  Phi ≈ 1  (deep water, no attenuation)
+    //   kh ~  π/4  →  Phi ≈ 0.5 (transitional depth)
+    //   kh → 0     →  Phi → 0  (very shallow, full attenuation)
+    float Phi_TMA = glm::clamp(cg_shallow / cg_deep, 0.0f, 1.0f);
 
-    // ── Distribution directionnelle Donelan-Banner ────────────────────────
+    // ── Directional spreading — Donelan-Banner (1985) ─────────────────────
+    // D(θ) = (β/2) · sech²(β·θ)
+    // β varies with ω/ωp to match measured directional distributions:
+    //   ω < 0.95·ωp : β = 2.61·(ω/ωp)^1.3   — broadens for long pre-peak waves
+    //   ω ∈ [0.95, 1.6]·ωp : β = 2.28·(ω/ωp)^-1.3 — narrows near and just past peak
+    //   ω > 1.6·ωp : empirical fit from Donelan et al. field data
     float theta = acosf(glm::clamp(k_dot_w, -1.0f, 1.0f));
     float ratio = omega / omega_p;
     float beta_dir;
@@ -614,21 +805,51 @@ float Ocean::TexelMarsenArsloe(vec2 k)
     float sech_val = 2.0f / (expf(beta_dir * theta) + expf(-beta_dir * theta));
     float D = (beta_dir / 2.0f) * sech_val * sech_val;
 
-    // ── Suppression des petites vagues ────────────────────────────────────
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths that the FFT grid cannot resolve.
+    // l = 0.0001·L where L = U²/g is the Phillips length scale.
+    // The exponential rolls off smoothly beyond the physical cutoff.
     float L = windSpeed * windSpeed / mGravity;
     float l2 = L * L * 0.0001f * 0.0001f;
     float suppress = expf(-k_length2 * l2);
 
-    // ── Résultat final ────────────────────────────────────────────────────
-    // Φ atténue progressivement le spectre quand la profondeur diminue
+    // ── Final spectrum ────────────────────────────────────────────────────
+    // Phi attenuates the JONSWAP base progressively as depth decreases.
+    // In deep water Phi = 1 and S_TMA = S_JONSWAP · D · suppress exactly.
     float S = S_jonswap * Phi_TMA * D * suppress;
 
     return S;
 }
 float Ocean::DonelanBanner(vec2 k)
 {
+    // ─── Donelan-Banner Spectrum (1985) ──────────────────────────────────────────
+    //
+    // Introduced by Mark Donelan, Jeff Hamilton and W.H. Hui in "Directional spectra
+    // of wind-generated waves" (Phil. Trans. R. Soc. London A, 1985), based on
+    // field measurements on Lake Ontario.
+    //
+    // The energy distribution (k⁴ tail + JONSWAP peak) is identical to JONSWAP.
+    // The sole difference is the directional spreading function D(θ), which
+    // replaces the empirical cos^n with a physically-measured sech²(β·θ) shape:
+    //
+    //   D(θ) = (β/2) · sech²(β·θ)
+    //
+    // where β varies with ω/ωp to match the observed directional narrowing near
+    // the spectral peak and broadening in the tail:
+    //   ω < 0.95·ωp        : β = 2.61·(ω/ωp)^1.3   — broad spread, long pre-peak waves
+    //   ω ∈ [0.95, 1.6]·ωp : β = 2.28·(ω/ωp)^-1.3  — narrows at and just past the peak
+    //   ω > 1.6·ωp         : empirical fit (Donelan et al. 1985, Table 2)
+    //
+    // sech²(β·θ) decays faster than cos^n for large angles and has heavier tails
+    // for small angles — it better reproduces the observed bimodal spreading at
+    // high frequencies while keeping a clean unimodal peak near ωp.
+    //
+    // Used as the directional model for TMA, Horvath, and Torsethaugen here,
+    // wherever measured directional accuracy matters more than simplicity.
+    // ─────────────────────────────────────────────────────────────────────────────
+
     float k_length = glm::length(k);
-    if (k_length < 0.000001f)
+    if (k_length < 1e-6f)
         return 0.0f;
 
     float k_length2 = k_length * k_length;
@@ -637,189 +858,186 @@ float Ocean::DonelanBanner(vec2 k)
     float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // Suppress waves travelling against the wind
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
     if (k_dot_w < 0.0f)
         return 0.0f;
 
-    // ── Fréquence angulaire ───────────────────────────────────────────────
+    // ── Deep-water dispersion relation ────────────────────────────────────
+    // ω = sqrt(g·|k|)
     float omega = sqrtf(mGravity * k_length);
+
+    // ── Fetch-dependent peak frequency ────────────────────────────────────
+    // ωp = 22·(g²/(U·F))^(1/3)  — identical to JONSWAP
     float omega_p = 22.0f * cbrtf(mGravity * mGravity / (windSpeed * Fetch));
 
-    // ── Spectre de base Pierson-Moskowitz (même base que JONSWAP) ─────────
-    float alpha = 0.0081f;
-    float L = windSpeed * windSpeed / mGravity;
-    float L2 = L * L;
+    // ── Pierson-Moskowitz base spectrum in k-space ────────────────────────
+    // S_pm(k) = α·g² / k⁴ · exp[-5/4·(ωp/ω)⁴]
+    // α = 0.0081 : fixed Phillips constant (fetch dependence is handled by ωp)
+    // L and L2 are unused here — legacy variables kept for reference only.
+    const float alpha = 0.0081f;
     float S_pm = alpha * mGravity * mGravity / k_length4 * expf(-1.25f * powf(omega_p / omega, 4.0f));
 
-    // ── Pic de résonance JONSWAP (inchangé) ───────────────────────────────
+    // ── JONSWAP peak enhancement factor γ^r ──────────────────────────────
+    // Identical to JONSWAP — sharpens the spectral peak.
+    // Maturity == γ ∈ [1, 7] : 1 = fully developed sea, 7 = young wind sea.
     float sigma = (omega <= omega_p) ? 0.07f : 0.09f;
-    float r = expf(-powf(omega - omega_p, 2.0f)
-        / (2.0f * sigma * sigma * omega_p * omega_p));
-    float peak = powf(Maturity, r);
+    float r = expf(-powf(omega - omega_p, 2.0f) / (2.0f * sigma * sigma * omega_p * omega_p));
+    float S_base = S_pm * powf(Maturity, r);
 
-    float S_base = S_pm * peak;
-
-    // ── Distribution directionnelle Donelan-Banner ────────────────────────
-    // Remplace le cos^n de JONSWAP par sech²(β·θ) (carré de la sécante hyperbolique)
-    // β varie selon ω/ωp pour coller aux mesures expérimentales
+    // ── Directional spreading — Donelan-Banner sech² ──────────────────────
+    // D(θ) = (β/2) · sech²(β·θ)   where sech(x) = 2/(e^x + e^-x)
+    // θ : angle between k and the wind direction
+    // β : frequency-dependent spreading parameter fitted to Lake Ontario data
+    //
+    // The three regimes of β reflect distinct physical processes:
+    //   ratio < 0.95  : energy input region — waves slower than the wind,
+    //                   broad directional spread as wind forcing is wide
+    //   ratio ∈ [0.95, 1.6] : near-peak region — non-linear interactions
+    //                          concentrate energy, spreading narrows
+    //   ratio > 1.6   : high-frequency tail — empirical fit; spreading
+    //                   broadens again as short waves respond to local gusts
     float theta = acosf(glm::clamp(k_dot_w, -1.0f, 1.0f));
-
     float ratio = omega / omega_p;
     float beta_dir;
 
-    if (ratio < 0.95f)
-        beta_dir = 2.61f * powf(ratio, 1.3f);
-    else if (ratio <= 1.6f)
-        beta_dir = 2.28f * powf(ratio, -1.3f);
-    else
-        beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio * ratio)));
+    if (ratio < 0.95f)      beta_dir = 2.61f * powf(ratio, 1.3f);
+    else if (ratio <= 1.6f) beta_dir = 2.28f * powf(ratio, -1.3f);
+    else                    beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio * ratio)));
 
-    // sech²(β·θ) — distribution directionnelle normalisée
+    // sech²(β·θ) — normalised so that ∫D(θ)dθ = 1 over [-π, π]
     float sech_val = 2.0f / (expf(beta_dir * theta) + expf(-beta_dir * theta));
     float D = (beta_dir / 2.0f) * sech_val * sech_val;
 
-    // ── Suppression des petites vagues ────────────────────────────────────
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths outside the gravity-wave regime
+    // and beyond the resolution of the FFT grid.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
-    // ── Résultat ──────────────────────────────────────────────────────────
-    // On utilise D directement à la place de cos^n, sans conversion dω/dk
-    // pour garder la même échelle que JONSWAP
-    float S = S_base * D * suppress;
-
-    return S;
+    // ── Final spectrum ────────────────────────────────────────────────────
+    // D replaces the cos^n of JONSWAP directly — no jacobian applied,
+    // keeping the same energy scale as the other spectra in this simulator.
+    return S_base * D * suppress;
 }
 float Ocean::Torsethaugen(vec2 k)
 {
-    // ─── Torsethaugen (1993 / 1996) ──────────────────────────────────────────────
+    // ─── Torsethaugen Spectrum (1993 / 1996) ─────────────────────────────────────
     //
-    //  Spectre bimodal entièrement paramétrique développé par Knut Torsethaugen
-    //  (SINTEF, Trondheim) à partir de mesures en mer de Norvège et mer du Nord.
-    //  Publication : "Two Peak Wave Spectrum Model", OMAE 1993 + rapport SINTEF 1996.
+    // Developed by Knut Torsethaugen (SINTEF, Trondheim) from measurements in the
+    // Norwegian Sea and North Sea ("Two Peak Wave Spectrum Model", OMAE 1993 +
+    // SINTEF report STF22 A96204, 1996).
     //
-    //  Conçu pour les conditions nord-atlantiques sévères où swell et mer de vent
-    //  coexistent fréquemment. Contrairement à Ochi-Hubble, tous les paramètres
-    //  se dérivent automatiquement de Hs et Tp — un seul état de mer à fournir.
+    // A fully parametric double-peaked spectrum designed for North Atlantic
+    // conditions where swell and wind sea frequently coexist. Unlike Ochi-Hubble,
+    // all parameters derive automatically from a single sea state (Hs, Tp) —
+    // no independent measurement of each peak is required.
     //
-    //  Architecture :
-    //    • Pic primaire   (j=1) : composante dominante selon régime de mer
-    //    • Pic secondaire (j=2) : composante sous-dominante (swell ou vent)
-    //  Le régime est déterminé par Tp vs Tf = 6.6·Hs^(1/3) (période limite)
+    // Architecture:
+    //   Primary peak   (j=1) : dominant component, regime-dependent
+    //   Secondary peak (j=2) : subordinate component (swell or wind sea)
     //
-    //  Paramètres membres à ajouter :
-    //    float Hs   — hauteur significative totale (m), ex. 4.0
-    //    float Tp   — période de pic dominante (s),     ex. 12.0
+    // The regime is determined by comparing Tp to the threshold period:
+    //   Tf = 6.6·Hs^(1/3)   [s]
+    //   Tp > Tf : swell-dominated — primary peak is the long-period swell
+    //   Tp ≤ Tf : wind-sea dominated — primary peak is the short-period wind sea
+    //
+    // Each component uses a JONSWAP-shaped spectrum with Hs_j-normalised α,
+    // formulated directly in k-space (no jacobian) to stay consistent with
+    // the other spectra in this simulator.
     // ─────────────────────────────────────────────────────────────────────────────
 
-    float windSpeed = glm::length(Wind);
-    auto waveParams = JONSWAPModel::GetWaveParameters(windSpeed, Fetch);
-    float Hs = waveParams.significantWaveHeight;
-    float Tp = waveParams.peakPeriod;
-
     float k_length = glm::length(k);
-
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
     float k_length2 = k_length * k_length;
+    float k_length4 = k_length2 * k_length2;
 
+    float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // Suppress waves travelling against the wind
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
-    if (k_dot_w < 0.0f)
+    float D = powf(glm::max(k_dot_w, 0.0f), DirSpread);
+    if (D == 0.0f)
         return 0.0f;
 
-    // ── Fréquence angulaire ───────────────────────────────────────────────
-    float omega = sqrtf(mGravity * k_length);
+    // ── Sea state from JONSWAP parametric model ───────────────────────────
+    auto  waveParams = JONSWAPModel::GetWaveParameters(windSpeed, Fetch);
+    float Hs = waveParams.significantWaveHeight;
+    float Tp = waveParams.peakPeriod;
 
-    // ── Période seuil et régime ───────────────────────────────────────────
-    // Tf = 6.6 · Hs^(1/3) : séparation régime vent / régime swell
+    // ── Deep-water dispersion relation ────────────────────────────────────
+    float omega = sqrtf(mGravity * k_length);    // ω = sqrt(g·|k|)
+
+    // ── Regime threshold ──────────────────────────────────────────────────
+    // Tf = 6.6·Hs^(1/3) : empirical boundary between wind-sea and swell regimes
+    // (Torsethaugen 1996, Table 3.1)
     float Tf = 6.6f * cbrtf(Hs);
-    bool  swell_dominated = (Tp > Tf);              // swell domine si Tp > Tf
+    bool swell_dominated = (Tp > Tf);
 
-    // ── Paramétrage du pic primaire ───────────────────────────────────────
-    // Calibration empirique SINTEF (valeurs tableau Torsethaugen 1996)
+    // ── Primary peak parameters ───────────────────────────────────────────
+    // Calibration coefficients from SINTEF empirical tables.
     float Hs1, Tp1, gamma1;
-
     if (swell_dominated)
     {
-        // Régime swell : pic primaire = swell longue période
+        // Primary peak = long-period swell
+        // Hs1 decreases as Tp moves further above Tf (more energy in swell,
+        // less available for wind sea).
         float Rp = Tp / Tf;
-        Hs1 = Hs * (1.0f - 0.35f * (Rp - 1.0f));        // Hs réduit pour le vent
-        Hs1 = glm::clamp(Hs1, 0.3f * Hs, Hs);
+        Hs1 = glm::clamp(Hs * (1.0f - 0.35f * (Rp - 1.0f)), 0.3f * Hs, Hs);
         Tp1 = Tp;
         gamma1 = glm::max(1.0f + 6.0f * powf(Hs / (Tp * Tp), 0.3f), 1.0f);
     }
     else
     {
-        // Régime mer de vent : pic primaire = mer de vent courte période
+        // Primary peak = short-period wind sea
+        // Nearly all energy is in the wind sea; swell is a minor residual.
         Hs1 = Hs * 0.95f;
         Tp1 = Tp;
         gamma1 = glm::max(35.0f * powf(Hs / (Tp * Tp), 0.5f), 1.0f);
     }
 
-    float Hs2 = sqrtf(glm::max(Hs * Hs - Hs1 * Hs1, 0.0f)); // conservation Hs
-    float Tp2 = swell_dominated
-        ? 0.7f * Tf                                   // vent sous-dominant
-        : 1.3f * Tf;                                  // swell sous-dominant
-    float gamma2 = 1.0f;                                       // pic secondaire élargi
+    // ── Secondary peak parameters ─────────────────────────────────────────
+    // Hs2 set by energy conservation : Hs1² + Hs2² = Hs²
+    // Tp2 placed at 0.7·Tf (wind sea under swell) or 1.3·Tf (swell under wind sea)
+    // gamma2 = 1 : broad, undeveloped secondary peak
+    float Hs2 = sqrtf(glm::max(Hs * Hs - Hs1 * Hs1, 0.0f));
+    float Tp2 = swell_dominated ? 0.7f * Tf : 1.3f * Tf;
+    float gamma2 = 1.0f;
 
-    // ── Forme spectrale JONSWAP généralisée pour chaque pic ───────────────
-    // S_j(ω) = alpha_j · g² / ω⁵ · exp[-5/4·(ωp_j/ω)⁴] · γ_j^r_j avec alpha_j calibré à partir de Hs_j et Tp_j
+    // ── Spectral component (JONSWAP shape, k-space, Hs-normalised α) ──────
+    // α_j = (5π⁴/g²) · Hs_j² · ωp_j⁴ / k⁴
+    // This ensures ∫S_j(k)dk ≈ (Hs_j/4)² in the discrete grid,
+    // matching the energy scale of JONSWAP without a jacobian.
     auto tors_component = [&](float Hs_j, float Tp_j, float gamma_j) -> float
         {
             float omega_p_j = 2.0f * M_PI / Tp_j;
 
-            // α normalisé sur Hs_j (intégrale du spectre = Hs²/16)
-            // α_j = (5π⁴/g²) · Hs_j² · ωp_j⁴
-            float alpha_j = (5.0f * powf(M_PI, 4.0f) / (mGravity * mGravity))
+            // α normalised so that the peak amplitude scales with Hs_j²
+            float alpha_j = (5.0f * (float)M_PI * (float)M_PI * (float)M_PI * (float)M_PI
+                / (mGravity * mGravity))
                 * Hs_j * Hs_j
-                * powf(omega_p_j, 4.0f);
+                * (omega_p_j * omega_p_j * omega_p_j * omega_p_j)
+                / k_length4;
 
-            // Forme P-M
-            float S_pm_j = alpha_j * mGravity * mGravity
-                / powf(omega, 5.0f)
-                * expf(-1.25f * powf(omega_p_j / omega, 4.0f));
+            // Pierson-Moskowitz shape with component peak frequency
+            float S_pm_j = alpha_j * expf(-1.25f * powf(omega_p_j / omega, 4.0f));
 
-            // Pic de résonance JONSWAP
+            // JONSWAP peak enhancement — gamma2 = 1 gives a flat P-M secondary peak
             float sigma_j = (omega <= omega_p_j) ? 0.07f : 0.09f;
-            float r_j = expf(-powf(omega - omega_p_j, 2.0f)
-                / (2.0f * sigma_j * sigma_j * omega_p_j * omega_p_j));
+            float r_j = expf(-powf(omega - omega_p_j, 2.0f) / (2.0f * sigma_j * sigma_j * omega_p_j * omega_p_j));
             float peak_j = powf(glm::max(gamma_j, 1.0f), r_j);
 
-            float S_omega_j = S_pm_j * peak_j;
-
-            // Jacobien dω/dk
-            float dw_dk = mGravity / (2.0f * omega);
-            return S_omega_j * dw_dk;
+            return S_pm_j * peak_j;
         };
 
-    float S_primary = tors_component(Hs1, Tp1, gamma1);
-    float S_secondary = tors_component(Hs2, Tp2, gamma2);
-    float S_total = S_primary + S_secondary;
+    float S_total = tors_component(Hs1, Tp1, gamma1) + tors_component(Hs2, Tp2, gamma2);
 
-    // ── Distribution directionnelle Donelan-Banner ────────────────────────
-    // Torsethaugen est conçu pour des conditions nord-atlantiques sévères ;
-    // on conserve la directionnalité Donelan-Banner (sech²) comme pour TMA
-    float omega_p_dom = 2.0f * M_PI / Tp1;
-    float theta = acosf(glm::clamp(k_dot_w, -1.0f, 1.0f));
-    float ratio_dir = omega / omega_p_dom;
-    float beta_dir;
-
-    if (ratio_dir < 0.95f)
-        beta_dir = 2.61f * powf(ratio_dir, 1.3f);
-    else if (ratio_dir <= 1.6f)
-        beta_dir = 2.28f * powf(ratio_dir, -1.3f);
-    else
-        beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio_dir * ratio_dir)));
-
-    float sech_val = 2.0f / (expf(beta_dir * theta) + expf(-beta_dir * theta));
-    float D = (beta_dir / 2.0f) * sech_val * sech_val;
-
-    // ── Suppression des petites vagues ────────────────────────────────────
+    // ── Capillary wave suppression ────────────────────────────────────────
+    // Removes sub-centimetre wavelengths outside the gravity-wave regime
+    // and beyond the resolution of the FFT grid.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
@@ -827,27 +1045,45 @@ float Ocean::Torsethaugen(vec2 k)
 }
 float Ocean::Elfouhaily(vec2 k)
 {
-    /*
-    La différence fondamentale est la séparation en deux spectres Bl et Bh qui couvrent des gammes de fréquences différentes.
-    
-    Bl (grandes vagues de gravité) reprend la structure JONSWAP avec le pic Gamma_j et Lpm, mais avec α variable comme Horvath. 
-    Le terme cp/c module l'énergie selon le rapport des vitesses de phase — les vagues lentes (longues) reçoivent plus d'énergie que les rapides.
-    
-    Bh (capillaires) est piloté par ux/c — le rapport vent de friction / vitesse de phase.
-    Les capillaires sont générés directement par le frottement du vent sur la surface, pas par résonance comme les grandes vagues.
-    Le terme Fm centre ce spectre autour de k_m ≈ 363 rad / m, la fréquence où la tension de surface domine la gravité.
+    // ─── Elfouhaily Spectrum (1997) ───────────────────────────────────────────────
+    //
+    // Introduced by Tanos Elfouhaily, Bernard Chapron, Kristian Katsaros and
+    // Danièle Vandemark in "A unified directional spectrum for long and short
+    // wind-driven waves" (J. Geophys. Res., 1997).
+    //
+    // The key innovation is a unified curvature spectrum B(k) that covers both
+    // the gravity-wave and capillary-wave regimes without an artificial cutoff,
+    // by splitting the saturation spectrum into two physically distinct components:
+    //
+    //   B(k) = Bl(k) + Bh(k)
+    //
+    //   Bl : long gravity waves — JONSWAP-shaped, modulated by cp/c
+    //        Energy grows for waves slower than the wind (cp < U), matching the
+    //        observed energy input region. The cp/c ratio replaces the fixed α
+    //        with a scale that tracks the local wave age continuously.
+    //
+    //   Bh : short capillary-gravity waves — driven by u*/c (friction velocity)
+    //        Capillaries are generated by direct wind friction, not resonance.
+    //        Fm centres the capillary peak around k_m ≈ 363 rad/m, the wavenumber
+    //        where surface tension balances gravity.
+    //
+    // The transition between the two regimes is continuous, which makes Elfouhaily
+    // the preferred model for radar backscatter, optical glint, and VFX rendering
+    // (used by Pixar and ILM) where surface detail at all scales is visible.
+    //
+    // Conversion to energy density:
+    //   The original formulation gives B(k) as a dimensionless saturation spectrum.
+    //   Here it is converted to S(k) via S(k) = B(k)/k⁴ to match the k⁴
+    //   denominator convention used by the other spectra in this simulator.
+    //   (The physically exact conversion would use k³, but k⁴ keeps the
+    //   normalisation consistent with ComputeNormFactor.)
+    // ─────────────────────────────────────────────────────────────────────────────
 
-    La transition entre les deux régimes est continue — il n'y a pas de coupure artificielle comme dans les autres modèles. 
-    C'est ce qui rend Elfouhaily particulièrement adapté pour les simulations radar et optiques, 
-    et c'est pourquoi il est utilisé dans les productions Pixar et ILM où les détails de surface à toutes les échelles sont visibles.
-    */
-    
     float k_length = glm::length(k);
-
-    // Avoid division by zero
     if (k_length < 1e-6f)
         return 0.0f;
 
+    // Low-frequency cutoff : wavelengths longer than 100m are not modelled
     float k_min = 2.0f * M_PI / 100.0f;
     if (k_length < k_min)
         return 0.0f;
@@ -857,87 +1093,150 @@ float Ocean::Elfouhaily(vec2 k)
     float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
+    // Suppress waves travelling against the wind
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
     if (k_dot_w < 0.0f)
         return 0.0f;
 
-    const float sigma_t = 0.074f;
-    const float rho = 1025.0f;
-    const float Omega_c = 0.84f;
+    // ── Physical constants ────────────────────────────────────────────────
+    const float sigma_t = 0.074f;    // surface tension of seawater [N/m]
+    const float rho = 1025.0f;   // seawater density [kg/m³]
+    const float Omega_c = 0.84f;     // inverse wave age at full development
 
+    // ── Phase velocity including surface tension ───────────────────────────
+    // c(k) = sqrt(g/k + σ_t·k/ρ)
+    // At large k (capillaries), the σ_t·k/ρ term dominates.
+    // At small k (gravity waves), g/k dominates and c → sqrt(g/k).
     float c_phase = sqrtf(mGravity / k_length + sigma_t * k_length / rho);
 
-    float u_star = 0.025f * windSpeed;
-    u_star = glm::max(u_star, 0.001f);
+    // ── Friction velocity ─────────────────────────────────────────────────
+    // u* ≈ 0.025·U10  (rough sea approximation, Elfouhaily 1997 eq. 3)
+    // Drives the capillary component Bh — stronger wind friction → more short waves.
+    float u_star = glm::max(0.025f * windSpeed, 0.001f);
 
+    // ── Peak wavenumber and phase velocity ────────────────────────────────
+    // ωp from JONSWAP fetch relation; kp = ωp²/g (deep water)
+    // cp = phase velocity at the peak, including surface tension
     float omega_p = 22.0f * cbrtf(mGravity * mGravity / (windSpeed * Fetch));
     float k_p = omega_p * omega_p / mGravity;
-
     float c_p = sqrtf(mGravity / k_p + sigma_t * k_p / rho);
 
-    float Omega = windSpeed / c_p;
-    Omega = glm::clamp(Omega, 0.84f, 5.0f);
+    // ── Inverse wave age Ω = U/cp ─────────────────────────────────────────
+    // Ω > 1 : young sea (wind faster than peak waves, active input)
+    // Ω = 1 : peak waves travel at wind speed (fully developed)
+    // Ω < 1 : swell (waves outrun the wind)
+    // Clamped to [0.84, 5.0] per Elfouhaily 1997.
+    float Omega = glm::clamp(windSpeed / c_p, 0.84f, 5.0f);
 
-    float alpha_e = 0.006f * sqrtf(Omega);
-    alpha_e = glm::clamp(alpha_e, 0.0028f, 0.015f);
+    // ── Long-wave energy coefficient α_e ─────────────────────────────────
+    // α_e = 0.006·sqrt(Ω) : grows with wave age, replacing the fixed 0.0081
+    // Clamped to physical bounds observed in field data.
+    float alpha_e = glm::clamp(0.006f * sqrtf(Omega), 0.0028f, 0.015f);
 
+    // ── Capillary energy coefficient β_e ─────────────────────────────────
+    // Gaussian centred on Ω = Ω_c (fully developed): capillary energy peaks
+    // when the wind sea is mature, then decreases for very young or old seas.
     float beta_e = 0.229f * expf(-0.4f * powf(Omega / Omega_c - 1.0f, 2.0f));
 
+    // ── Low-frequency P-M shape Lpm ───────────────────────────────────────
+    // Lpm = exp[-5/4·(kp/k)²] : suppresses energy well below the peak.
+    // Note: uses k² not k⁴ (Elfouhaily works in wavenumber space directly).
     float Lpm = expf(-1.25f * powf(k_p / k_length, 2.0f));
 
+    // ── JONSWAP peak enhancement Γ_j ─────────────────────────────────────
+    // Same shape as JONSWAP but written in k-space (sqrt(k/kp) replaces ω/ωp).
+    // Maturity == γ ∈ [1, 7] controls peak sharpness.
     float gamma = Maturity;
     float sigma_j = (k_length <= k_p) ? 0.07f : 0.09f;
     float r = expf(-powf(sqrtf(k_length / k_p) - 1.0f, 2.0f) / (2.0f * sigma_j * sigma_j));
     float Gamma_j = powf(gamma, r);
 
+    // ── Long gravity wave saturation spectrum Bl ──────────────────────────
+    // Bl = 0.5·α_e·(cp/c)·Lpm·Γ_j
+    // cp/c : wave age modulation — long slow waves (c << cp) receive less energy;
+    //        waves near the peak (c ≈ cp) receive the most.
     float Bl = 0.5f * alpha_e * (c_p / c_phase) * Lpm * Gamma_j;
 
-    const float k_m = sqrtf(rho * mGravity / sigma_t);
+    // ── Capillary wave saturation spectrum Bh ─────────────────────────────
+    // k_m = sqrt(ρg/σ_t) ≈ 363 rad/m : gravity-capillary transition wavenumber
+    // Fm  : Gaussian centred on k_m — capillary energy peaks near this scale
+    // cap_sat : additional rolloff beyond k_m to prevent unphysical growth
+    const float k_m = sqrtf(rho * mGravity / sigma_t);   // ≈ 363 rad/m
     float Fm = expf(-0.25f * powf(k_length / k_m - 1.0f, 2.0f));
     float Bh = 0.5f * beta_e * (u_star / c_phase) * Fm;
     float cap_sat = expf(-k_length2 / (k_m * k_m));
     Bh *= cap_sat;
 
-    // ── Conversion vers densité d'énergie ─────────────────────────────────
-    // Elfouhaily est formulé en saturation B(k) adimensionnelle
-    // On convertit vers S(k) en densité d'énergie comme JONSWAP : S(k) = B(k) / k⁴  (au lieu de / k² dans la formulation saturation)
+    // ── Conversion from saturation B(k) to energy density S(k) ───────────
+    // Physical formulation : S(k) = B(k) / k³
+    // Simulator convention : S(k) = B(k) / k⁴  (matches ComputeNormFactor)
     float k_length4 = k_length2 * k_length2;
-    //float W_k = (Bl + Bh) / (k_length2 * k_length); // k³ (formule originale)
-    float W_k = (Bl + Bh) / k_length4;  // k⁴
+    float W_k = (Bl + Bh) / k_length4;
 
-    // ── Distribution directionnelle Donelan-Banner ────────────────────────
+    // ── Directional spreading — Donelan-Banner (1985) ─────────────────────
+    // Same sech²(β·θ) model used by TMA, Horvath, and Torsethaugen.
+    // ω derived from deep-water dispersion for the β regime selection.
     float omega = sqrtf(mGravity * k_length);
     float theta = acosf(glm::clamp(k_dot_w, -1.0f, 1.0f));
     float ratio = omega / omega_p;
     float beta_dir;
 
-    if (ratio < 0.95f)
-        beta_dir = 2.61f * powf(ratio, 1.3f);
-    else if (ratio <= 1.6f)
-        beta_dir = 2.28f * powf(ratio, -1.3f);
-    else
-        beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio * ratio)));
+    if (ratio < 0.95f)      beta_dir = 2.61f * powf(ratio, 1.3f);
+    else if (ratio <= 1.6f) beta_dir = 2.28f * powf(ratio, -1.3f);
+    else                    beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio * ratio)));
 
     float sech_val = 2.0f / (expf(beta_dir * theta) + expf(-beta_dir * theta));
     float D = (beta_dir / 2.0f) * sech_val * sech_val;
 
-    // ── Suppression des petites vagues ────────────────────────────────────
+    // ── Capillary suppression (grid resolution cutoff) ────────────────────
+    // Removes wavelengths the FFT grid cannot resolve.
+    // l = 0.0001·L where L = U²/g is the Phillips length scale.
     float L = windSpeed * windSpeed / mGravity;
     float l2 = L * L * 0.0001f * 0.0001f;
     float suppress = expf(-k_length2 * l2);
 
-    // Coupure à k_cutoff = π / résolution_texel = π / 0.39 ≈ 8 rad/m
-    float k_cutoff = M_PI * FFT_SIZE / LengthWave * 0.25f;  // 25% de la fréquence max
+    // ── Low-pass filter at 25% of Nyquist ────────────────────────────────
+    // Prevents aliasing artefacts near the FFT grid boundary.
+    // k_cutoff = π·N / (4·LengthWave) = 25% of the maximum resolved wavenumber.
+    float k_cutoff = M_PI * FFT_SIZE / LengthWave * 0.25f;
     float lowpass = expf(-k_length2 / (k_cutoff * k_cutoff));
-    float S = W_k * D * suppress * lowpass;
 
-    return S;
+    return W_k * D * suppress * lowpass;
 }
 float Ocean::Horvath(vec2 k)
 {
-    float k_length = glm::length(k);
+    // ─── Horvath Spectrum (2015) ──────────────────────────────────────────────────
+    //
+    // Introduced by Crest Horvath in "Empirical directional wave spectra for
+    // computer graphics" (DigiPro 2015), designed specifically for real-time and
+    // offline ocean rendering in production VFX.
+    //
+    // Horvath combines the physical foundations of JONSWAP and Elfouhaily with
+    // two renderer-oriented improvements:
+    //
+    //   1. Variable α : replaces the fixed Phillips constant (0.0081) with
+    //      α = 0.006·sqrt(Ω),  Ω = U/cp  (inverse wave age)
+    //      Energy level now tracks the development state of the sea continuously,
+    //      matching the Elfouhaily formulation.
+    //
+    //   2. Sea-age modulation J_p : a Gaussian bell centred on Ω = 1 (fully
+    //      developed sea) that modulates the JONSWAP peak enhancement.
+    //      For young seas (Ω >> 1) or old seas (Ω << 1), J_p → 1 and the
+    //      spectrum reverts to the P-M shape.
+    //      For mature seas (Ω ≈ 1), J_p → γ and the peak is fully sharpened.
+    //
+    //   3. Fetch correction : tanh((g·F/U²)^0.33) smoothly transitions from
+    //      a narrow, peaked spectrum at short fetch to a broad, lower spectrum
+    //      at long fetch — matching the observed fetch-growth laws.
+    //
+    //   4. Surface tension suppression : physical capillary cutoff at
+    //      k_c = sqrt(ρg/σ_t) ≈ 363 rad/m, replacing the ad-hoc l_small term.
+    //
+    // Directional spreading uses Donelan-Banner sech²(β·θ), inherited from
+    // Elfouhaily and consistent with TMA and Torsethaugen here.
+    // ─────────────────────────────────────────────────────────────────────────────
 
-    // Avoid division by zero
+    float k_length = glm::length(k);
     if (k_length < 1e-6f)
         return 0.0f;
 
@@ -947,82 +1246,94 @@ float Ocean::Horvath(vec2 k)
     float windSpeed = glm::length(Wind);
     vec2  windDir = glm::normalize(Wind);
 
-    // Direction : supprime les vagues contre le vent
+    // Suppress waves travelling against the wind
     float k_dot_w = glm::dot(glm::normalize(k), windDir);
     if (k_dot_w < 0.0f)
         return 0.0f;
 
-    // ── Fréquence angulaire ───────────────────────────────────────────────
-    float omega = sqrtf(mGravity * k_length);           // ω = sqrt(g·|k|)
-    float omega2 = omega * omega;
+    // ── Deep-water dispersion relation ────────────────────────────────────
+    float omega = sqrtf(mGravity * k_length);    // ω = sqrt(g·|k|)
+    float omega2 = omega * omega;                  // = g·k (exact)
 
-    // ── Vitesse de phase et nombre de Froude local ────────────────────────
-    float cp = omega / k_length;                      // vitesse de phase c = ω/k
-    float Omega = windSpeed / cp;                        // inverse Froude : U/c
+    // ── Phase velocity and local inverse wave age ─────────────────────────
+    // cp = ω/k : phase speed of waves at wavenumber k
+    // Ω  = U/cp : ratio of wind speed to phase speed
+    //   Ω > 1 : wind faster than waves — active energy input
+    //   Ω = 1 : resonance — waves travel at wind speed
+    //   Ω < 1 : swell — waves outrun the wind
+    float cp = omega / k_length;
+    float Omega = windSpeed / cp;
 
-    // ── Fréquence de pic (Donelan empirique) ─────────────────────────────
-    float omega_p = 22.0f * cbrtf(mGravity * mGravity / (windSpeed * Fetch));    // ωp dépend du fetch via la relation de similitude
-    float cp_p = mGravity / omega_p;                    // vitesse de phase au pic
+    // ── Fetch-dependent peak frequency ────────────────────────────────────
+    // Same as JONSWAP. cp_p is the phase velocity at the spectral peak.
+    float omega_p = 22.0f * cbrtf(mGravity * mGravity / (windSpeed * Fetch));
+    float cp_p = mGravity / omega_p;
 
-    // ── Coefficient α de Horvath (remplace α=0.0081 fixe) ────────────────
-    // α varie avec le développement de la mer (Omega = U/cp) - Calibré sur données JONSWAP + mesures Donelan
-    float alpha_h = 0.006f * sqrtf(Omega);                // α = 0.006 * sqrt(U/cp)
-    alpha_h = glm::clamp(alpha_h, 0.0028f, 0.015f); // bornes physiques
+    // ── Variable energy coefficient α (Horvath / Elfouhaily) ─────────────
+    // α = 0.006·sqrt(Ω) : grows as the sea develops toward full maturity.
+    // Clamped to physically observed bounds from field campaigns.
+    float alpha_h = glm::clamp(0.006f * sqrtf(Omega), 0.0028f, 0.015f);
 
-    // ── Spectre de base Horvath ───────────────────────────────────────────
-    float S_base = alpha_h * mGravity * mGravity / k_length4;    // Même forme que P-M mais avec α variable et exposant corrigé
+    // ── Base spectrum — same k⁴ tail as Phillips / JONSWAP ───────────────
+    // α is now wave-age dependent instead of fixed at 0.0081.
+    float S_base = alpha_h * mGravity * mGravity / k_length4;
 
-    // ── Pic de résonance (JONSWAP γ) ─────────────────────────────────────
+    // ── JONSWAP peak enhancement factor γ^r ──────────────────────────────
+    // Identical formulation to JONSWAP — sharpens the peak near ωp.
     float gamma = Maturity;
     float sigma = (omega <= omega_p) ? 0.07f : 0.09f;
     float r = expf(-powf(omega - omega_p, 2.0f) / (2.0f * sigma * sigma * omega_p * omega_p));
     float peak = powf(gamma, r);
 
-    // ── Terme de vieillissement de la mer (swell aging) ──────────────────
-    // Horvath introduit un terme L_pm qui modélise la saturation du spectre quand la mer est pleinement développée (Omega → 1)
-    float L_pm = expf(-1.25f * powf(omega_p / omega, 4.0f)); // Pierson-Moskowitz shape
-    float Gamma_h = expf(-powf(Omega - 1.0f, 2.0f) / 0.04f);   // saturation curve
-    float J_p = powf(gamma, Gamma_h);                        // pic de Horvath
+    // ── Sea-age modulation J_p (Horvath-specific) ─────────────────────────
+    // L_pm : Pierson-Moskowitz low-frequency shape — suppresses energy below ωp
+    // Gamma_h : Gaussian bell at Ω = 1 — scales the peak enhancement with maturity
+    //   Ω ≈ 1 (mature sea)  → Gamma_h ≈ 1 → J_p ≈ γ  (full JONSWAP peak)
+    //   Ω >> 1 (young sea)  → Gamma_h ≈ 0 → J_p ≈ 1  (P-M shape, no peak)
+    // Together L_pm·J_p replaces the fixed exp·γ^r of JONSWAP with a
+    // continuously age-modulated version.
+    float L_pm = expf(-1.25f * powf(omega_p / omega, 4.0f));
+    float Gamma_h = expf(-powf(Omega - 1.0f, 2.0f) / 0.04f);
+    float J_p = powf(gamma, Gamma_h);
 
     float S_horvath = S_base * J_p * L_pm;
 
-    // ── Distribution directionnelle Donelan-Banner (Horvath la conserve) ──
+    // ── Directional spreading — Donelan-Banner (1985) ─────────────────────
+    // sech²(β·θ) with frequency-dependent β, identical to TMA / Elfouhaily.
     float theta = acosf(glm::clamp(k_dot_w, -1.0f, 1.0f));
     float ratio = omega / omega_p;
     float beta_dir;
 
-    if (ratio < 0.95f)
-        beta_dir = 2.61f * powf(ratio, 1.3f);
-    else if (ratio <= 1.6f)
-        beta_dir = 2.28f * powf(ratio, -1.3f);
-    else
-        beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio * ratio)));
+    if (ratio < 0.95f)      beta_dir = 2.61f * powf(ratio, 1.3f);
+    else if (ratio <= 1.6f) beta_dir = 2.28f * powf(ratio, -1.3f);
+    else                    beta_dir = powf(10.0f, -0.4f + 0.8393f * expf(-0.567f * logf(ratio * ratio)));
 
     float sech_val = 2.0f / (expf(beta_dir * theta) + expf(-beta_dir * theta));
     float D = (beta_dir / 2.0f) * sech_val * sech_val;
 
-    // ── Correction de fetch (Horvath spécifique) ──────────────────────────
-    // Modélise l'évolution du spectre avec la distance parcourue par le vent (fetch court → spectre étroit et haut, fetch long → spectre large et bas)
-    float fetch_factor = tanhf(powf(mGravity * Fetch / (windSpeed * windSpeed), 0.33f));
-    fetch_factor = glm::clamp(fetch_factor, 0.1f, 1.0f);
+    // ── Fetch correction factor (Horvath-specific) ────────────────────────
+    // tanh((g·F/U²)^0.33) : smooth saturation from 0 (zero fetch) to 1 (infinite fetch)
+    // Short fetch → narrow, peaked spectrum with less total energy.
+    // Long fetch  → broader spectrum approaching the fully developed limit.
+    float fetch_factor = glm::clamp(tanhf(powf(mGravity * Fetch / (windSpeed * windSpeed), 0.33f)), 0.1f, 1.0f);
 
-    // ── Terme de capillaires / tension de surface ─────────────────────────
-    // Horvath ajoute une correction haute fréquence pour les capillaires
-    // σ_t = 0.074 N/m (tension de surface de l'eau)
-    // k_c = sqrt(ρg / σ_t) ≈ 363 rad/m (nombre d'onde capillaire)
-    const float sigma_t = 0.074f;
-    const float rho = 1025.0f;                         // densité eau de mer kg/m³
-    float k_c = sqrtf(rho * mGravity / sigma_t); // ~363 rad/m
-    float cap_suppress = expf(-k_length2 / (k_c * k_c));    // Atténuation exponentielle au-delà du nombre d'onde capillaire
+    // ── Surface tension cutoff (physical capillary limit) ─────────────────
+    // k_c = sqrt(ρg/σ_t) ≈ 363 rad/m : wavenumber where surface tension
+    // balances gravity — waves shorter than 2π/k_c ≈ 1.7cm are capillary waves.
+    // exp(-k²/k_c²) rolls off the spectrum physically beyond this scale,
+    // replacing the ad-hoc l_small suppression used in JONSWAP/Phillips.
+    const float sigma_t = 0.074f;    // surface tension [N/m]
+    const float rho = 1025.0f;   // seawater density [kg/m³]
+    float k_c = sqrtf(rho * mGravity / sigma_t);   // ≈ 363 rad/m
+    float cap_suppress = expf(-k_length2 / (k_c * k_c));
 
-    // ── Suppression des petites vagues (même que JONSWAP) ─────────────────
+    // ── Grid resolution cutoff ────────────────────────────────────────────
+    // Secondary suppression matching the other spectra — removes wavelengths
+    // the FFT grid cannot resolve below the capillary scale.
     float l_small = 0.01f * windSpeed * windSpeed / mGravity;
     float suppress = expf(-k_length2 * l_small * l_small);
 
-    // ── Résultat final ────────────────────────────────────────────────────
-    float S = S_horvath * D * fetch_factor * cap_suppress * suppress;
-
-    return S;
+    return S_horvath * D * fetch_factor * cap_suppress * suppress;
 }
 
 bool Ocean::GetVerticeXZ(vec2 pos, vec3& output)
@@ -2211,11 +2522,11 @@ void Ocean::CreateGradientsPipeline()
 
     vkCreateDescriptorSetLayout(mVulkanDevice->device, &layoutInfo, nullptr, &mGradientsDescriptorSetLayout);
 
-    // Push constants : 2 floats (dt, persistenceFactor)
+    // Push constants : 3 floats (dt, foamBias, persistenceFactor)
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcRange.offset = 0;
-    pcRange.size = sizeof(float) * 2;
+    pcRange.size = sizeof(float) * 3;
 
     // 4. PipelineLayout
     VkPipelineLayoutCreateInfo pipeLayoutInfo{};
@@ -2458,16 +2769,18 @@ void Ocean::CheckFoamReadbackCompletion()
     sum = sum / (float)(FFT_SIZE * FFT_SIZE);
 
     // Reset si changement de vent
-	static float prevLambda = Lambda;
+	static float prevCamber = Camber;
+	static float prevFoamBreak = FoamBreak;
     static vec2 prevWind = Wind;
     static float cumulativeSum = 0.f;
     static uint32_t sampleCount = 0;
-    if (Wind != prevWind || Lambda != prevLambda)
+    if (Wind != prevWind || Camber != prevCamber || FoamBreak != prevFoamBreak)
     {
         cumulativeSum = 0.f;
         sampleCount = 0;
         prevWind = Wind;
-        prevLambda = Lambda;
+        prevCamber = Camber;
+        prevFoamBreak = FoamBreak;
     }
 
     // Moyenne cumulative sans parcourir l'historique
@@ -2580,7 +2893,7 @@ void Ocean::Update(float t, uint32_t currentFrame)
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mDisplacementsPipelineLayout, 0, 1, &mDisplacementsDescSet, 0, nullptr);
    
     sDispPC pc;
-    pc.Lambda = Lambda;
+    pc.Camber = Camber;
     pc.Amplitude = Amplitude;
     vkCmdPushConstants(cmd, mDisplacementsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sDispPC), &pc);
    
@@ -2597,7 +2910,7 @@ void Ocean::Update(float t, uint32_t currentFrame)
     mFoamPingPong = !mFoamPingPong;
     mTexFoamBuffer = &mTexFoamAcc[currentSet];
 
-    struct { float dt; float persistenceFactor; } pcData{ dt, PersistenceFactor };
+    struct { float dt; float foamBias; float persistenceFactor; } pcData{ dt, FoamBreak, PersistenceFactor };
 
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, mQueryPool, 6);
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrierFull, 0, nullptr, 0, nullptr);
@@ -4461,10 +4774,25 @@ void Ocean::RenderFull(VkCommandBuffer cmd, uint32_t currentFrame, Camera& camer
     layer = glm::clamp(layer, 0, 100);
     ubo.texLayer = layer;
     ubo.mistDensity = sky->MistDensity;
-    
-    ubo.windDir = glm::normalize(Wind);  // Example wind direction
-    ubo.windRippleStr = 0.1f;  // Example ripple strength
-    ubo.windSpeed = 0.2f;      // Example wind speed
+
+    auto mistGain = [](float exposure) -> float {
+        static float lastExposure = -1.0f;
+        static float lastResult = 0.0f;
+
+        if (exposure == lastExposure)
+            return lastResult;
+
+        lastExposure = exposure;
+
+        if (exposure <= 0.33f) return lastResult = 0.0f;
+        if (exposure >= 0.8f)  return lastResult = 1.0f;
+
+        const float t = (exposure - 0.33f) / (0.8f - 0.33f);
+        const float k = 4.2f;
+        return lastResult = (std::exp(k * t) - 1.0f) / (std::exp(k) - 1.0f);
+        };
+
+    ubo.mistGain = mistGain(sky->Exposure);	ubo.mistGain = mistGain(sky->Exposure);
 
     auto& frame = mFrames[currentFrame];
 

@@ -4,7 +4,7 @@ http://creativecommons.org/licenses/by-nc-nd/4.0/ */
 
 #pragma once
 
-// 1. PROJET
+// 1. PROJECT
 #include "Structures.h"
 #include "Camera.h"
 #include "Utility.h"
@@ -129,7 +129,7 @@ public:
 	const int			MESH_SIZE		= 256;				// Dimension of the mesh (number of cells on one side of the grid)
 	const int			MESH_SIZE_1		= MESH_SIZE + 1;	 
 	const int			PATCH_SIZE		= 100;				// Size of the mesh grid in meters
-	const int			LengthWave		= 60;	// Waves of wavelength between 60 / (512/2) = 0.23m (Nyquist limit) and 60 m
+	const int			LengthWave		= 60;				// Waves of wavelength between 60 / (512/2) = 0.23m (Nyquist limit) and 60 m
 
 	inline static const char* SpectrumNames[] = {
 						"Phillips",				// 0
@@ -149,8 +149,7 @@ public:
 	// Parameters
 	vec2				Wind			= { 0.0f, 1.0f };	// Input of wind (no need to be normalized at this stage)
 	float				Amplitude		= 1.0f;				// Amplitude of the waves
-	float				Lambda			= 0.5f;				// Factor of choppiness (exagerate the displacements)
-	bool				bAutoLambda		= false;			// Adapt or not the choppiness
+	float				Camber			= 2.5f;				// Factor of choppiness (exagerate the displacements)
 	int					Spectre			= 0;				// Type of spectrum (Philipps, JONSWAP, etc.)
 	float				DirSpread		= 4.0f;
 	float				Maturity		= 3.3f;				// 1 = no peak (full developped sea), 3.3 = value measured in the North Sea, 7 = young sea undergoing rapid development
@@ -159,7 +158,7 @@ public:
 	atomic<bool>		NeedsReinitFrequencies{ false };	// Thread-safe (no data race)
 	atomic<bool>		NeedsClearRecords{ false };			// Thread-safe (no data race)
 
-	vec3				OceanColor;
+	vec3				OceanColor		= vec3(0, 40, 55);
 	int					iOceanColor		= 6;
 	vector<vec3>		vOceanColors	= {
 				vec3(67,  74,  55),	// 0 - Estuary
@@ -174,13 +173,14 @@ public:
 				vec3( 1, 169, 193),	// 9 - Lagoon
 				};
 
-	float				PersistenceSec		= 1.0f;
+	float				FoamBreak			= 0.65f;
+	float				FoamPersistence		= 1.5f;
 	float				PersistenceFactor	= 1.0f;
 	float				Transparency		= 0.05f;
 	float				WhitecapCoverageReal = 0.0f;
 	float				WhitecapCoverageTheoretical = 0.0f;
 
-	vector<WaveData>	vWaveData;						// time, dx, dy, dz
+	vector<WaveData>	vWaveData;							// time, dx, dy, dz
 	bool				bNewData			= false;
 	float				HeightMax			= 0.0f;
 	float				HeightMin			= 0.0f;
@@ -291,7 +291,7 @@ private:
 	// Mesh
 	unique_ptr<VulkanBuffer>    mVertexBuffer;
 	unique_ptr<VulkanBuffer>    mIndexBuffer;
-	uint32_t					mIndicesCount;
+	uint32_t					mIndicesCount				= 0;
 	VkSampler					mTextureSampler				= nullptr;
 
 	// Textures
@@ -312,7 +312,7 @@ private:
 	// Uniform buffer pour time
 	VkBuffer					mTimeBuffer					= nullptr;
 	VkDeviceMemory				mTimeMemory					= nullptr;
-	void					  * mTimeData;
+	void					  * mTimeData					= nullptr;
 
 	// Spectrum pipeline
 	VkPipeline					mSpectrumPipeline			= nullptr;
@@ -333,7 +333,7 @@ private:
 	// Displacement pipeline
 	struct sDispPC
 	{
-		float Lambda;
+		float Camber;
 		float Amplitude;
 	};
 	VkPipeline					mDisplacementsPipeline		= nullptr;
@@ -356,24 +356,24 @@ private:
 
 	// Readback displacement
 	unique_ptr<float[]>			mPixelsDisplacements		= nullptr;
-	VkDeviceSize				mStagingSize;
-	VkBuffer					mStagingBuffer;
-	VkDeviceMemory				mStagingMem;
-	void					  * mStagingData;
+	VkDeviceSize				mStagingSize				= 0;
+	VkBuffer					mStagingBuffer				= nullptr;
+	VkDeviceMemory				mStagingMem					= nullptr;
+	void					  * mStagingData				= nullptr;
 	VkFence						mReadbackFence;
-	VkCommandBuffer				mReadbackCmd;
+	VkCommandBuffer				mReadbackCmd				= nullptr;
 	bool						mReadbackPending			= false;
 
 	// Readback foam
 	unique_ptr<float[]>			mPixelsFoam					= nullptr;
 	vector<float>				mvFoamHistory;
 
-	VkDeviceSize				mFoamStagingSize;
-	VkBuffer					mFoamStagingBuffer;
-	VkDeviceMemory				mFoamStagingMem;
-	void					  * mFoamStagingData;
+	VkDeviceSize				mFoamStagingSize			= 0;
+	VkBuffer					mFoamStagingBuffer			= nullptr;
+	VkDeviceMemory				mFoamStagingMem				= nullptr;
+	void					  * mFoamStagingData			= nullptr;
 	VkFence						mFoamReadbackFence;
-	VkCommandBuffer				mFoamReadbackCmd;
+	VkCommandBuffer				mFoamReadbackCmd			= nullptr;
 	bool						mFoamReadbackPending		= false;
 
 	// Wireframe rendering pipeline
@@ -383,20 +383,20 @@ private:
 	sPipeline_x					mOneMeshPipeline;
 
 	// Instances
-	int							iMinPatchDecal = 0;
-	int							iMaxPatchDecal = 0;
-	int							jMinPatchDecal = 0;
-	int							jMaxPatchDecal = 0;
+	int							iMinPatchDecal				= 0;
+	int							iMaxPatchDecal				= 0;
+	int							jMinPatchDecal				= 0;
+	int							jMaxPatchDecal				= 0;
 	vector<sLODPatch>			mvLODPatches;
-	vector<uint32_t>			mvMeshSizes = { 256, 128, 32, 8, 4 };	// LOD 0, 1, 2, 3, 4
+	vector<uint32_t>			mvMeshSizes					= { 256, 128, 32, 8, 4 };	// LOD 0, 1, 2, 3, 4
 	vector<sFrameData>			mFrames;
 
 	// Ocean rendering pipeline (LOD instancié)
-	sPipeline_x 					mLODPipeline;			// 5 LOD
+	sPipeline_x 				mLODPipeline;					// 5 LOD
 	vector<sInstanceData>		mvInstanceData[5];
 
 	// Ocean rendering pipeline (LOD instancing with wake)
-	sPipeline_x 					mPipelineTexture;			// 1 LOD for the ocean around the ship
+	sPipeline_x 				mPipelineTexture;				// 1 LOD for the ocean around the ship
 	vector<sInstanceData>		mvInstanceWakeData;
 
 	// Timestapms

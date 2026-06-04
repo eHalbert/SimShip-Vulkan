@@ -4,7 +4,7 @@ http://creativecommons.org/licenses/by-nc-nd/4.0/ */
 
 #pragma once
 
-// 1. PROJET
+// 1. PROJECT
 #include "Structures.h"
 #include "Utility.h"
 #include "Ocean.h"
@@ -282,7 +282,6 @@ private:
 	vector<vec3> ArrangeContour(const vector<vec3>& contourUnordered);
 	vector<vec3> ArrangeByCoordinates(const vector<vec3>& contourUnordered);
 	vector<vec3> ArrangeByPolarAngle(const vector<vec3>& contourUnordered);
-	vector<vec3> ArrangeByNearestNeighbor(const vector<vec3>& contourUnordered);
 	
 	vector<vec3> OffsetContour(const vector<vec3>& contour, float offset);
 	void	CreateTextureOfContour(shared_ptr<VulkanDevice>& vulkanDevice, const vector<vec3>& contour);
@@ -292,13 +291,15 @@ private:
 	int		GetHeightSlow(vec3& pos);
 	void	UpdateWorldMatrix();
 	void	TransformVertices();
+	void	GetHeightMax();
 	void	GetHeightOfAllVertices();
 	void	GetTrisUnderWater();
 	void	ComputeMaxSpeed();
 	void	ComputeEquilibriumDraft();
 
 	// Wake by vao
-	void	UpdateWakeMesh();
+	void	UpdateWakeMeshDoublePropeller();
+	void	UpdateWakeMeshSinglePropeller();
 
 	// SYSTEM OF FORCES
 	void	ComputeArchimede();
@@ -346,6 +347,7 @@ private:
 	unique_ptr<LineMesh>mContourMesh1;
 	unique_ptr<LineMesh>mContourMesh2;
 	unique_ptr<LineMesh>mPressureMesh;
+	float				mHeightMax			= 0.0f;
 
 	// Full model
 	string				mPathnameFull;
