@@ -3,7 +3,7 @@ This work is licensed under a Creative Commons Attribution-NonCommercial-NoDeriv
 http://creativecommons.org/licenses/by-nc-nd/4.0/ */
 
 #pragma once
-// 1. PROJET
+// 1. PROJECT
 #include "Utility.h"
 #include "vulkan_device.hpp"
 #include "vulkan_ubo.hpp"

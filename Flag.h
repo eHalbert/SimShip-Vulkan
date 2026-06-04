@@ -6,7 +6,7 @@ http://creativecommons.org/licenses/by-nc-nd/4.0/ */
 
 // Simulation Verlet avec des springs structuraux, de flexion et diagonaux pour simuler un tissu
 
-// 1. PROJET
+// 1. PROJECT
 #include "Utility.h"
 #include "Camera.h"
 #include "Sky.h"
